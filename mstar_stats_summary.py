@@ -10,6 +10,7 @@ a CSV with the steady-state average and standard deviation of every variable.
 Example:
     python mstar_stats_summary.py test              # auto-detect steady state
     python mstar_stats_summary.py test --time 5.0   # steady state = t >= 5 s
+    python mstar_stats_summary.py test --plot       # plot all variables
     python mstar_stats_summary.py test --plot "mean velocity" "power number"
 """
 
@@ -188,63 +189,100 @@ def write_csv(rows: list[dict], out_path: Path) -> None:
 
 # ---------------------------------------------------------------- plots
 
+def plot_file(rel: str, header: list[str], data: np.ndarray, queries: list[str],
+              t_start: float, out_html: Path) -> int:
+    """Write one interactive HTML of subplots for a stats file; returns subplot count."""
+    import math
+
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    times = data[:, 0]
+    traces = []  # (var_name, t, v, mean, std)
+    for j in range(1, len(header)):
+        name = header[j].strip()
+        if queries and not any(q in norm_name(name) for q in queries):
+            continue
+        vals = data[:, j]
+        ok = np.isfinite(times) & np.isfinite(vals)
+        t, v = times[ok], vals[ok]
+        if t.size == 0:
+            continue
+        steady = t >= t_start
+        mean = float(v[steady].mean()) if steady.any() else np.nan
+        std = float(v[steady].std(ddof=1)) if steady.sum() > 1 else 0.0
+        traces.append((name, t, v, mean, std))
+    if not traces:
+        return 0
+
+    n = len(traces)
+    ncols = math.ceil(math.sqrt(n))
+    nrows = math.ceil(n / ncols)
+    fig = make_subplots(rows=nrows, cols=ncols,
+                        subplot_titles=[name for name, *_ in traces],
+                        vertical_spacing=min(0.35 / nrows, 0.12),
+                        horizontal_spacing=0.08)
+
+    for i, (name, t, v, mean, std) in enumerate(traces):
+        r, c = divmod(i, ncols)
+        r, c = r + 1, c + 1
+        fig.add_trace(go.Scatter(x=t, y=v, mode="lines", name=name,
+                                 line=dict(width=1), showlegend=False,
+                                 hovertemplate="t=%{x:.4g} s<br>%{y:.5g}<extra></extra>"),
+                      row=r, col=c)
+        fig.add_vline(x=t_start, line_dash="dash", line_color="green",
+                      line_width=1, row=r, col=c)
+        if np.isfinite(mean):
+            fig.add_hrect(y0=mean - std, y1=mean + std, fillcolor="red",
+                          opacity=0.1, line_width=0, row=r, col=c)
+            fig.add_hline(y=mean, line_dash="dot", line_color="red", line_width=1,
+                          annotation_text=f"{mean:.4g} \u00b1 {std:.3g}",
+                          annotation_font_size=10, row=r, col=c)
+        fig.update_xaxes(title_text="Time [s]", title_font_size=10, row=r, col=c)
+        fig.update_yaxes(title_text=var_unit(name), title_font_size=10, row=r, col=c)
+
+    fig.update_annotations(font_size=10)
+    fig.update_layout(
+        title=f"{rel} (steady state: t \u2265 {t_start:.3g} s, green line; "
+              f"red: steady mean \u00b1 std)",
+        height=max(400, 300 * nrows), template="plotly_white", margin=dict(t=90))
+    fig.write_html(str(out_html))
+    return n
+
+
 def make_plots(files: list[Path], stats_dir: Path, queries: list[str],
                t_start: float, out_dir: Path) -> None:
-    """Plot the time course of every variable matching a query (fuzzy, unit-free)."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
+    """One HTML per stats file; queries (if any) limit which variables are plotted."""
     qn = [q.strip().lower() for q in queries]
-    matched = {q: 0 for q in qn}
     out_dir.mkdir(parents=True, exist_ok=True)
-    n_plots = 0
 
+    if qn:
+        matched = {q: 0 for q in qn}
+        for f in files:
+            table = load_stats_table(f)
+            if table is None:
+                continue
+            for h in table[0][1:]:
+                for q in qn:
+                    if q in norm_name(h):
+                        matched[q] += 1
+        for q, count in matched.items():
+            if count == 0:
+                warn(f"--plot '{q}' matched no variables")
+
+    n_files = 0
     for f in files:
         table = load_stats_table(f)
         if table is None:
             continue
         header, data = table
         rel = str(f.relative_to(stats_dir))
-        times = data[:, 0]
-        for j in range(1, len(header)):
-            name = header[j].strip()
-            hits = [q for q in qn if q == norm_name(name) or q in norm_name(name)]
-            if not hits:
-                continue
-            for q in hits:
-                matched[q] += 1
-            vals = data[:, j]
-            ok = np.isfinite(times) & np.isfinite(vals)
-            t, v = times[ok], vals[ok]
-            if t.size == 0:
-                continue
-            steady = t >= t_start
-            mean = float(v[steady].mean()) if steady.any() else np.nan
-            std = float(v[steady].std(ddof=1)) if steady.sum() > 1 else 0.0
-
-            fig, ax = plt.subplots(figsize=(8, 4.5))
-            ax.plot(t, v, lw=1, color="steelblue")
-            ax.axvline(t_start, color="tab:green", ls="--",
-                       label=f"steady-state start @ {t_start:.2f} s")
-            if np.isfinite(mean):
-                ax.axhline(mean, color="tab:red", ls=":",
-                           label=f"steady mean = {mean:.4g} \u00b1 {std:.3g}")
-                ax.axhspan(mean - std, mean + std, color="tab:red", alpha=0.1)
-            ax.set_xlabel("Time [s]")
-            ax.set_ylabel(name)
-            ax.set_title(f"{rel}: {name}")
-            ax.legend(fontsize=8)
-            fig.tight_layout()
-            stem = re.sub(r"[^\w.-]+", "_", f"{Path(rel).with_suffix('')}_{norm_name(name)}")
-            fig.savefig(out_dir / f"{stem}.png", dpi=150)
-            plt.close(fig)
-            n_plots += 1
-
-    for q in qn:
-        if matched[q] == 0:
-            warn(f"--plot '{q}' matched no variables")
-    log(f"wrote {n_plots} plot(s) to {out_dir}")
+        stem = re.sub(r"[^\w.-]+", "_", str(Path(rel).with_suffix("")))
+        n = plot_file(rel, header, data, qn, t_start, out_dir / f"{stem}.html")
+        if n:
+            log(f"  {stem}.html: {n} subplot(s)")
+            n_files += 1
+    log(f"wrote {n_files} plot file(s) to {out_dir}")
 
 
 # ---------------------------------------------------------------- main
@@ -263,9 +301,10 @@ def main(argv=None):
                     help="steady-state tolerance on windowed-mean drift")
     ap.add_argument("--output", type=Path, default=None,
                     help="output CSV path (default: <case>/stats_summary.csv)")
-    ap.add_argument("--plot", nargs="+", metavar="VAR", default=None,
-                    help="plot the time course of variables matching these names "
-                         "(fuzzy, e.g. 'mean velocity', 'power number')")
+    ap.add_argument("--plot", nargs="*", metavar="VAR", default=None,
+                    help="write one interactive HTML of plots per stats file; "
+                         "give variable names (fuzzy) to limit which are plotted, "
+                         "or no names to plot all variables")
     ap.add_argument("--plot-dir", type=Path, default=None,
                     help="plot output directory (default: <case>/stats_plots)")
     args = ap.parse_args(argv)
@@ -302,7 +341,7 @@ def main(argv=None):
     out = args.output or (args.case if args.case.is_dir() else args.case.parent) / "stats_summary.csv"
     write_csv(rows, out)
 
-    if args.plot:
+    if args.plot is not None:
         plot_dir = args.plot_dir or (args.case if args.case.is_dir() else args.case.parent) / "stats_plots"
         make_plots(files, stats_dir, args.plot, t_start, plot_dir)
     log("done")
