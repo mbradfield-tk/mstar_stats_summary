@@ -1,0 +1,89 @@
+mstar_stats_summary - CLI usage
+===============================
+
+Steady-state summary of all variables tracked in an M-Star Stats folder.
+Scans every tab-delimited stats file recursively (e.g. Fluid.txt,
+MovingBody_*.txt, ControlVolume_*/FieldData.txt), determines a single
+steady-state start time, and writes a CSV with the steady-state average
+and standard deviation of every variable. Optionally writes interactive
+HTML plots.
+
+SYNOPSIS
+--------
+    python mstar_stats_summary.py CASE [options]
+
+ARGUMENTS
+---------
+    CASE                M-Star case directory, a directory containing a
+                        Stats/ folder, or the Stats directory itself.
+                        With --batch: a parent directory whose subfolders
+                        are individual cases.
+
+OPTIONS
+-------
+    --batch             Treat CASE as a parent directory and process every
+                        subfolder containing stats. Writes one
+                        stats_summary.csv per case plus a combined
+                        batch_summary.csv (with a leading "case" column)
+                        in the parent directory.
+
+    --time T            User-defined steady-state start time in seconds.
+                        Overrides automatic detection.
+                        (default: auto-detect from the mean fluid velocity
+                        plateau in Fluid.txt)
+
+    --window W          Steady-state detection window in seconds.
+                        (default: 1.0)
+
+    --tol TOL           Steady-state tolerance on windowed-mean drift.
+                        (default: 0.02)
+
+    --output PATH       Output CSV path.
+                        (default: <case>/stats_summary.csv; with --batch,
+                        the combined batch CSV, default
+                        <parent>/batch_summary.csv)
+
+    --plot [VAR ...]    Write one interactive HTML file of plots per stats
+                        file. Give variable names (fuzzy-matched, case-
+                        insensitive, units ignored) to limit which variables
+                        are plotted, or no names to plot all variables.
+
+    --plot-dir PATH     Plot output directory.
+                        (default: <case>/stats_plots; ignored with --batch,
+                        where plots go to <case>/stats_plots in each case)
+
+    -h, --help          Show help message and exit.
+
+EXAMPLES
+--------
+    # Auto-detect steady state and write <case>/stats_summary.csv
+    python mstar_stats_summary.py test
+
+    # Use a fixed steady-state start time of 5 s
+    python mstar_stats_summary.py test --time 5.0
+
+    # Plot all variables (one HTML per stats file)
+    python mstar_stats_summary.py test --plot
+
+    # Plot only selected variables (fuzzy name match)
+    python mstar_stats_summary.py test --plot "mean velocity" "power number"
+
+    # Custom detection settings and output locations
+    python mstar_stats_summary.py test --window 2.0 --tol 0.01 \
+        --output results.csv --plot --plot-dir my_plots
+
+    # Bulk-process every case subfolder under runs/
+    python mstar_stats_summary.py runs --batch
+
+OUTPUT
+------
+    stats_summary.csv   One row per variable: source file, variable name,
+                        unit, steady-state average and standard deviation,
+                        plus the steady-state start time and detection method.
+
+    stats_plots/        (with --plot) One interactive HTML file per stats
+                        file, showing the time course of each variable.
+
+    batch_summary.csv   (with --batch) Combined summary of all cases in the
+                        parent directory, with a leading "case" column; each
+                        case also gets its own stats_summary.csv.

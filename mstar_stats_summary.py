@@ -12,6 +12,7 @@ Example:
     python mstar_stats_summary.py test --time 5.0   # steady state = t >= 5 s
     python mstar_stats_summary.py test --plot       # plot all variables
     python mstar_stats_summary.py test --plot "mean velocity" "power number"
+    python mstar_stats_summary.py runs --batch      # process every case in runs/
 """
 
 from __future__ import annotations
@@ -39,10 +40,8 @@ def fail(msg: str) -> None:
 
 # ---------------------------------------------------------------- discovery
 
-def find_stats_dir(root: Path) -> Path:
+def locate_stats_dir(root: Path) -> Path | None:
     """Accept a case dir, a dir containing Stats/, or the Stats dir itself."""
-    if not root.exists():
-        fail(f"path not found: {root}")
     if root.is_dir():
         if root.name.lower() == "stats":
             return root
@@ -51,7 +50,16 @@ def find_stats_dir(root: Path) -> Path:
             return hits[0]
         if any(root.glob("*.txt")):
             return root
-    fail(f"no Stats folder (or .txt stats files) found under {root}")
+    return None
+
+
+def find_stats_dir(root: Path) -> Path:
+    if not root.exists():
+        fail(f"path not found: {root}")
+    stats_dir = locate_stats_dir(root)
+    if stats_dir is None:
+        fail(f"no Stats folder (or .txt stats files) found under {root}")
+    return stats_dir
 
 
 def find_stats_files(stats_dir: Path) -> list[Path]:
@@ -179,9 +187,9 @@ COLUMNS = ["file", "variable", "unit", "steady_method", "steady_start_s",
            "end_time_s", "n_samples", "mean", "std", "min", "max"]
 
 
-def write_csv(rows: list[dict], out_path: Path) -> None:
+def write_csv(rows: list[dict], out_path: Path, columns: list[str] = COLUMNS) -> None:
     with open(out_path, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=COLUMNS)
+        w = csv.DictWriter(fh, fieldnames=columns)
         w.writeheader()
         w.writerows(rows)
     log(f"wrote {out_path} ({len(rows)} variables)")
@@ -287,32 +295,13 @@ def make_plots(files: list[Path], stats_dir: Path, queries: list[str],
 
 # ---------------------------------------------------------------- main
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
-                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("case", type=Path,
-                    help="M-Star case directory, or the Stats directory itself")
-    ap.add_argument("--time", type=float, default=None,
-                    help="user-defined steady-state start time [s]; "
-                         "overrides automatic detection")
-    ap.add_argument("--window", type=float, default=1.0,
-                    help="steady-state detection window [s]")
-    ap.add_argument("--tol", type=float, default=0.02,
-                    help="steady-state tolerance on windowed-mean drift")
-    ap.add_argument("--output", type=Path, default=None,
-                    help="output CSV path (default: <case>/stats_summary.csv)")
-    ap.add_argument("--plot", nargs="*", metavar="VAR", default=None,
-                    help="write one interactive HTML of plots per stats file; "
-                         "give variable names (fuzzy) to limit which are plotted, "
-                         "or no names to plot all variables")
-    ap.add_argument("--plot-dir", type=Path, default=None,
-                    help="plot output directory (default: <case>/stats_plots)")
-    args = ap.parse_args(argv)
-
-    stats_dir = find_stats_dir(args.case)
+def process_case(case: Path, stats_dir: Path, args,
+                 output: Path | None = None, plot_dir: Path | None = None) -> list[dict]:
+    """Summarize one case; write its CSV (and plots); return its rows ([] on failure)."""
     files = find_stats_files(stats_dir)
     if not files:
-        fail(f"no .txt stats files found in {stats_dir}")
+        warn(f"no .txt stats files found in {stats_dir}")
+        return []
     log(f"stats folder: {stats_dir} ({len(files)} files)")
 
     if args.time is not None:
@@ -322,7 +311,9 @@ def main(argv=None):
         t_start = steady_from_fluid_velocity(files, args.window, args.tol)
         method = "auto"
         if t_start is None:
-            fail("could not detect a mean-velocity plateau; specify --time instead")
+            warn(f"{case}: could not detect a mean-velocity plateau; "
+                 "specify --time instead")
+            return []
         log(f"steady state detected at t = {t_start:.3f} s "
             f"(mean fluid velocity plateau, window={args.window} s, tol={args.tol})")
 
@@ -336,14 +327,82 @@ def main(argv=None):
         else:
             warn(f"  {rel}: skipped (not a time-course stats table, or no data after t_start)")
     if not rows:
-        fail("no variables summarized")
+        warn(f"{case}: no variables summarized")
+        return []
 
-    out = args.output or (args.case if args.case.is_dir() else args.case.parent) / "stats_summary.csv"
-    write_csv(rows, out)
+    base = case if case.is_dir() else case.parent
+    write_csv(rows, output or base / "stats_summary.csv")
 
     if args.plot is not None:
-        plot_dir = args.plot_dir or (args.case if args.case.is_dir() else args.case.parent) / "stats_plots"
-        make_plots(files, stats_dir, args.plot, t_start, plot_dir)
+        make_plots(files, stats_dir, args.plot, t_start,
+                   plot_dir or base / "stats_plots")
+    return rows
+
+
+def find_batch_cases(parent: Path) -> list[tuple[Path, Path]]:
+    """Return (case dir, stats dir) for each immediate subfolder with stats files."""
+    cases = []
+    for sub in sorted(p for p in parent.iterdir() if p.is_dir()):
+        stats_dir = locate_stats_dir(sub)
+        if stats_dir is not None:
+            cases.append((sub, stats_dir))
+    return cases
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
+                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    ap.add_argument("case", type=Path,
+                    help="M-Star case directory, or the Stats directory itself; "
+                         "with --batch, a parent directory of case subfolders")
+    ap.add_argument("--batch", action="store_true",
+                    help="treat CASE as a parent directory and process every "
+                         "subfolder containing stats; writes one CSV per case "
+                         "plus a combined batch CSV")
+    ap.add_argument("--time", type=float, default=None,
+                    help="user-defined steady-state start time [s]; "
+                         "overrides automatic detection")
+    ap.add_argument("--window", type=float, default=1.0,
+                    help="steady-state detection window [s]")
+    ap.add_argument("--tol", type=float, default=0.02,
+                    help="steady-state tolerance on windowed-mean drift")
+    ap.add_argument("--output", type=Path, default=None,
+                    help="output CSV path (default: <case>/stats_summary.csv; "
+                         "with --batch, the batch CSV, default "
+                         "<parent>/batch_summary.csv)")
+    ap.add_argument("--plot", nargs="*", metavar="VAR", default=None,
+                    help="write one interactive HTML of plots per stats file; "
+                         "give variable names (fuzzy) to limit which are plotted, "
+                         "or no names to plot all variables")
+    ap.add_argument("--plot-dir", type=Path, default=None,
+                    help="plot output directory (default: <case>/stats_plots; "
+                         "ignored with --batch)")
+    args = ap.parse_args(argv)
+
+    if args.batch:
+        if not args.case.is_dir():
+            fail(f"--batch requires a directory: {args.case}")
+        cases = find_batch_cases(args.case)
+        if not cases:
+            fail(f"no case subfolders with stats found under {args.case}")
+        log(f"batch mode: {len(cases)} case(s) under {args.case}")
+
+        batch_rows = []
+        for case, stats_dir in cases:
+            log(f"=== case: {case.name} ===")
+            rows = process_case(case, stats_dir, args)
+            for r in rows:
+                batch_rows.append({"case": case.name, **r})
+        if not batch_rows:
+            fail("no variables summarized in any case")
+        out = args.output or args.case / "batch_summary.csv"
+        write_csv(batch_rows, out, columns=["case"] + COLUMNS)
+    else:
+        stats_dir = find_stats_dir(args.case)
+        rows = process_case(args.case, stats_dir, args,
+                            output=args.output, plot_dir=args.plot_dir)
+        if not rows:
+            fail("no variables summarized")
     log("done")
 
 
