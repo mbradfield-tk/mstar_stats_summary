@@ -7,7 +7,8 @@ start time from the plateau of the mean fluid velocity in Fluid.txt
 (windowed-mean drift criterion), or uses a user-defined start time, and writes
 a CSV with the steady-state average and standard deviation of every variable.
 For scalar tracers (Scalar_*.txt), also reports the 95% mixed time, i.e. when
-the concentration RSD last drops below 5%.
+the concentration RSD last drops below 5%, measured from tracer injection
+(detected as the end of the initial zero-concentration period).
 
 Example:
     python mstar_stats_summary.py test              # auto-detect steady state
@@ -206,9 +207,23 @@ def mixing_time_from_rsd(times: np.ndarray, rsd: np.ndarray,
     return float(t0 + (r0 - threshold) / (r0 - r1) * (t1 - t0))
 
 
-def mixing_time_rows(files: list[Path], stats_dir: Path, threshold: float) -> list[dict]:
-    """One row per RSD column found in Scalar_*.txt files."""
-    rows = []
+def injection_start(times: np.ndarray, conc: np.ndarray) -> float | None:
+    """Time the tracer is added: last sample at which mean conc is still zero."""
+    nz = np.nonzero(conc > 0)[0]
+    if nz.size == 0:
+        return None
+    return float(times[nz[0] - 1]) if nz[0] > 0 else float(times[0])
+
+
+def scalar_mixing(files: list[Path], stats_dir: Path,
+                  threshold: float) -> tuple[list[dict], dict[Path, tuple[float, str]]]:
+    """Mixing-time CSV rows for Scalar_*.txt files, plus per-file plot markers.
+
+    Reported mixed times are measured from tracer injection (detected as the
+    period while the mean concentration is zero). Returns (rows,
+    {file: (absolute mixed time, label)}) for plotting.
+    """
+    rows, vlines = [], {}
     for f in files:
         if not f.name.lower().startswith("scalar_"):
             continue
@@ -217,33 +232,46 @@ def mixing_time_rows(files: list[Path], stats_dir: Path, threshold: float) -> li
             continue
         header, data = table
         rel = str(f.relative_to(stats_dir))
+        times = data[:, 0]
+        normed = [norm_name(h) for h in header]
+
+        t_inj = None
+        if "conc mean" in normed:
+            conc = data[:, normed.index("conc mean")]
+            ok = np.isfinite(times) & np.isfinite(conc)
+            t_inj = injection_start(times[ok], conc[ok])
+        if t_inj is None:
+            t_inj = float(times[0])
+            warn(f"  {rel}: could not detect tracer injection "
+                 f"(no nonzero 'Conc Mean'); assuming injection at t = {t_inj:g} s")
+        else:
+            log(f"  {rel}: tracer injection detected at t = {t_inj:.3f} s")
+        common = {"file": rel, "unit": "s", "steady_start_s": "",
+                  "end_time_s": float(times[-1]), "n_samples": len(times),
+                  "std": "", "min": "", "max": ""}
+        rows.append({**common, "variable": "tracer injection time",
+                     "steady_method": "conc>0", "mean": t_inj})
+
         for j in range(1, len(header)):
-            if "rsd" not in norm_name(header[j]):
+            if "rsd" not in normed[j]:
                 continue
-            times, rsd = data[:, 0], data[:, j]
+            rsd = data[:, j]
             ok = np.isfinite(times) & np.isfinite(rsd)
-            t_mix = mixing_time_from_rsd(times[ok], rsd[ok], threshold)
-            label = (f"{100 - threshold:g}% mixed time "
+            t_mix_abs = mixing_time_from_rsd(times[ok], rsd[ok], threshold)
+            label = (f"{100 - threshold:g}% mixed time from injection "
                      f"('{header[j].strip()}' < {threshold:g}%)")
-            if t_mix is None:
+            if t_mix_abs is None:
                 warn(f"  {rel}: {label}: RSD never crosses below "
                      f"{threshold:g}% (or never exceeds it); skipped")
                 continue
-            log(f"  {rel}: {label} = {t_mix:.3f} s")
-            rows.append({
-                "file": rel,
-                "variable": label,
-                "unit": "s",
-                "steady_method": "rsd",
-                "steady_start_s": "",
-                "end_time_s": float(times[ok][-1]),
-                "n_samples": int(ok.sum()),
-                "mean": t_mix,
-                "std": "",
-                "min": "",
-                "max": "",
-            })
-    return rows
+            t_mix = t_mix_abs - t_inj
+            log(f"  {rel}: {label} = {t_mix:.3f} s (at t = {t_mix_abs:.3f} s)")
+            rows.append({**common, "variable": label,
+                         "steady_method": "rsd", "mean": t_mix})
+            vlines.setdefault(f, (t_mix_abs,
+                                  f"{100 - threshold:g}% mixed "
+                                  f"({t_mix:.3g} s after injection)"))
+    return rows, vlines
 
 
 def write_csv(rows: list[dict], out_path: Path, columns: list[str] = COLUMNS) -> None:
@@ -257,7 +285,8 @@ def write_csv(rows: list[dict], out_path: Path, columns: list[str] = COLUMNS) ->
 # ---------------------------------------------------------------- plots
 
 def plot_file(rel: str, header: list[str], data: np.ndarray, queries: list[str],
-              t_start: float, out_html: Path) -> int:
+              t_start: float, out_html: Path,
+              mix_vline: tuple[float, str] | None = None) -> int:
     """Write one interactive HTML of subplots for a stats file; returns subplot count."""
     import math
 
@@ -299,6 +328,9 @@ def plot_file(rel: str, header: list[str], data: np.ndarray, queries: list[str],
                       row=r, col=c)
         fig.add_vline(x=t_start, line_dash="dash", line_color="green",
                       line_width=1, row=r, col=c)
+        if mix_vline is not None:
+            fig.add_vline(x=mix_vline[0], line_dash="dot", line_color="purple",
+                          line_width=1, row=r, col=c)
         if np.isfinite(mean):
             fig.add_hrect(y0=mean - std, y1=mean + std, fillcolor="red",
                           opacity=0.1, line_width=0, row=r, col=c)
@@ -309,16 +341,20 @@ def plot_file(rel: str, header: list[str], data: np.ndarray, queries: list[str],
         fig.update_yaxes(title_text=var_unit(name), title_font_size=10, row=r, col=c)
 
     fig.update_annotations(font_size=10)
+    title = (f"{rel} (steady state: t \u2265 {t_start:.3g} s, green line; "
+             f"red: steady mean \u00b1 std)")
+    if mix_vline is not None:
+        title += f"<br><sup>purple dotted line: {mix_vline[1]}</sup>"
     fig.update_layout(
-        title=f"{rel} (steady state: t \u2265 {t_start:.3g} s, green line; "
-              f"red: steady mean \u00b1 std)",
+        title=title,
         height=max(400, 300 * nrows), template="plotly_white", margin=dict(t=90))
     fig.write_html(str(out_html))
     return n
 
 
 def make_plots(files: list[Path], stats_dir: Path, queries: list[str],
-               t_start: float, out_dir: Path) -> None:
+               t_start: float, out_dir: Path,
+               mix_vlines: dict[Path, tuple[float, str]] | None = None) -> None:
     """One HTML per stats file; queries (if any) limit which variables are plotted."""
     qn = [q.strip().lower() for q in queries]
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -345,7 +381,8 @@ def make_plots(files: list[Path], stats_dir: Path, queries: list[str],
         header, data = table
         rel = str(f.relative_to(stats_dir))
         stem = re.sub(r"[^\w.-]+", "_", str(Path(rel).with_suffix("")))
-        n = plot_file(rel, header, data, qn, t_start, out_dir / f"{stem}.html")
+        n = plot_file(rel, header, data, qn, t_start, out_dir / f"{stem}.html",
+                      mix_vline=(mix_vlines or {}).get(f))
         if n:
             log(f"  {stem}.html: {n} subplot(s)")
             n_files += 1
@@ -389,14 +426,15 @@ def process_case(case: Path, stats_dir: Path, args,
         warn(f"{case}: no variables summarized")
         return []
 
-    rows.extend(mixing_time_rows(files, stats_dir, args.mix_rsd))
+    rows_mix, mix_vlines = scalar_mixing(files, stats_dir, args.mix_rsd)
+    rows.extend(rows_mix)
 
     base = case if case.is_dir() else case.parent
     write_csv(rows, output or base / "stats_summary.csv")
 
     if args.plot is not None:
         make_plots(files, stats_dir, args.plot, t_start,
-                   plot_dir or base / "stats_plots")
+                   plot_dir or base / "stats_plots", mix_vlines=mix_vlines)
     return rows
 
 

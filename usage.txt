@@ -40,10 +40,14 @@ OPTIONS
 
     --mix-rsd PCT       RSD threshold in % for the mixed-time of scalar
                         tracers; 5% RSD = 95% mixed. Applied to any RSD
-                        column in Scalar_*.txt files; the mixed time is
-                        when RSD last crosses below the threshold
-                        (linearly interpolated), reported as an extra row
-                        in the CSV. (default: 5.0)
+                        column in Scalar_*.txt files. The mixed time is
+                        when RSD last crosses below the threshold (linearly
+                        interpolated), measured from tracer injection
+                        (detected as the end of the initial period where
+                        the mean concentration is zero). The injection time
+                        and mixed time are reported as extra rows in the
+                        CSV, and tracer plots get a dotted vertical line at
+                        the absolute mixed time. (default: 5.0)
 
     --output PATH       Output CSV path.
                         (default: <case>/stats_summary.csv; with --batch,
