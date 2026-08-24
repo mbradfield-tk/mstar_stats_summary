@@ -6,6 +6,8 @@ MovingBody_*.txt, ControlVolume_*/FieldData.txt), detects a single steady-state
 start time from the plateau of the mean fluid velocity in Fluid.txt
 (windowed-mean drift criterion), or uses a user-defined start time, and writes
 a CSV with the steady-state average and standard deviation of every variable.
+For scalar tracers (Scalar_*.txt), also reports the 95% mixed time, i.e. when
+the concentration RSD last drops below 5%.
 
 Example:
     python mstar_stats_summary.py test              # auto-detect steady state
@@ -187,6 +189,63 @@ COLUMNS = ["file", "variable", "unit", "steady_method", "steady_start_s",
            "end_time_s", "n_samples", "mean", "std", "min", "max"]
 
 
+# ---------------------------------------------------------------- mixing time
+
+def mixing_time_from_rsd(times: np.ndarray, rsd: np.ndarray,
+                         threshold: float) -> float | None:
+    """Time when RSD last crosses below threshold [%] (linear interpolation).
+
+    Returns None if RSD never exceeds the threshold (no injection resolved)
+    or is still above it at the end of the trace (not yet mixed).
+    """
+    above = rsd >= threshold
+    if not above.any() or above[-1]:
+        return None
+    i = int(np.max(np.nonzero(above)))
+    t0, t1, r0, r1 = times[i], times[i + 1], rsd[i], rsd[i + 1]
+    return float(t0 + (r0 - threshold) / (r0 - r1) * (t1 - t0))
+
+
+def mixing_time_rows(files: list[Path], stats_dir: Path, threshold: float) -> list[dict]:
+    """One row per RSD column found in Scalar_*.txt files."""
+    rows = []
+    for f in files:
+        if not f.name.lower().startswith("scalar_"):
+            continue
+        table = load_stats_table(f)
+        if table is None:
+            continue
+        header, data = table
+        rel = str(f.relative_to(stats_dir))
+        for j in range(1, len(header)):
+            if "rsd" not in norm_name(header[j]):
+                continue
+            times, rsd = data[:, 0], data[:, j]
+            ok = np.isfinite(times) & np.isfinite(rsd)
+            t_mix = mixing_time_from_rsd(times[ok], rsd[ok], threshold)
+            label = (f"{100 - threshold:g}% mixed time "
+                     f"('{header[j].strip()}' < {threshold:g}%)")
+            if t_mix is None:
+                warn(f"  {rel}: {label}: RSD never crosses below "
+                     f"{threshold:g}% (or never exceeds it); skipped")
+                continue
+            log(f"  {rel}: {label} = {t_mix:.3f} s")
+            rows.append({
+                "file": rel,
+                "variable": label,
+                "unit": "s",
+                "steady_method": "rsd",
+                "steady_start_s": "",
+                "end_time_s": float(times[ok][-1]),
+                "n_samples": int(ok.sum()),
+                "mean": t_mix,
+                "std": "",
+                "min": "",
+                "max": "",
+            })
+    return rows
+
+
 def write_csv(rows: list[dict], out_path: Path, columns: list[str] = COLUMNS) -> None:
     with open(out_path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=columns)
@@ -330,6 +389,8 @@ def process_case(case: Path, stats_dir: Path, args,
         warn(f"{case}: no variables summarized")
         return []
 
+    rows.extend(mixing_time_rows(files, stats_dir, args.mix_rsd))
+
     base = case if case.is_dir() else case.parent
     write_csv(rows, output or base / "stats_summary.csv")
 
@@ -366,6 +427,9 @@ def main(argv=None):
                     help="steady-state detection window [s]")
     ap.add_argument("--tol", type=float, default=0.02,
                     help="steady-state tolerance on windowed-mean drift")
+    ap.add_argument("--mix-rsd", type=float, default=5.0, metavar="PCT",
+                    help="RSD threshold [%%] for the mixed-time of scalar "
+                         "tracers (5%% RSD = 95%% mixed)")
     ap.add_argument("--output", type=Path, default=None,
                     help="output CSV path (default: <case>/stats_summary.csv; "
                          "with --batch, the batch CSV, default "

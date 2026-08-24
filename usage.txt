@@ -38,6 +38,13 @@ OPTIONS
     --tol TOL           Steady-state tolerance on windowed-mean drift.
                         (default: 0.02)
 
+    --mix-rsd PCT       RSD threshold in % for the mixed-time of scalar
+                        tracers; 5% RSD = 95% mixed. Applied to any RSD
+                        column in Scalar_*.txt files; the mixed time is
+                        when RSD last crosses below the threshold
+                        (linearly interpolated), reported as an extra row
+                        in the CSV. (default: 5.0)
+
     --output PATH       Output CSV path.
                         (default: <case>/stats_summary.csv; with --batch,
                         the combined batch CSV, default
