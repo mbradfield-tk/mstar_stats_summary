@@ -282,6 +282,65 @@ def write_csv(rows: list[dict], out_path: Path, columns: list[str] = COLUMNS) ->
     log(f"wrote {out_path} ({len(rows)} variables)")
 
 
+DEFAULT_MEANS_VARS = [
+    "energy dissipation", "velocity", "vorticity", "mixed time", "shear",
+    "power number", "fluid volume", "viscosity", "density",
+    "rotation speed", "angular velocity",
+]
+
+
+def write_wide_csv(batch_rows: list[dict], out_path: Path,
+                   queries: list[str], warn_unmatched: bool = True) -> None:
+    """One row per case, one 'variable [units]' column per variable, values = means.
+
+    Only variables fuzzy-matching one of the queries are included. Variables
+    tracked in more than one stats file are prefixed with the file name to
+    keep columns unique.
+    """
+    qn = [q.strip().lower() for q in queries]
+    rows = [r for r in batch_rows
+            if any(q in norm_name(r["variable"]) for q in qn)]
+    if warn_unmatched:
+        for q in qn:
+            if not any(q in norm_name(r["variable"]) for r in batch_rows):
+                warn(f"means CSV: '{q}' matched no variables")
+    if not rows:
+        warn(f"means CSV: no variables matched; skipping {out_path}")
+        return
+
+    def base_name(r: dict) -> str:
+        name = r["variable"]
+        if r["unit"] and f"[{r['unit']}]" not in name:
+            name = f"{name} [{r['unit']}]"
+        return name
+
+    files_per_var: dict[str, set] = {}
+    for r in rows:
+        files_per_var.setdefault(base_name(r), set()).add(r["file"])
+
+    def col_name(r: dict) -> str:
+        name = base_name(r)
+        if len(files_per_var[name]) > 1:
+            stem = str(Path(r["file"]).with_suffix(""))
+            name = f"{stem}: {name}"
+        return name
+
+    cols: list[str] = []
+    data: dict[str, dict[str, object]] = {}
+    for r in rows:
+        c = col_name(r)
+        if c not in cols:
+            cols.append(c)
+        data.setdefault(r["case"], {})[c] = r["mean"]
+
+    with open(out_path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=["case"] + cols, restval="")
+        w.writeheader()
+        for case, vals in data.items():
+            w.writerow({"case": case, **vals})
+    log(f"wrote {out_path} ({len(data)} cases x {len(cols)} variables)")
+
+
 # ---------------------------------------------------------------- plots
 
 def plot_file(rel: str, header: list[str], data: np.ndarray, queries: list[str],
@@ -472,6 +531,12 @@ def main(argv=None):
                     help="output CSV path (default: <case>/stats_summary.csv; "
                          "with --batch, the batch CSV, default "
                          "<parent>/batch_summary.csv)")
+    ap.add_argument("--means-vars", nargs="*", metavar="VAR", default=None,
+                    help="variable names (fuzzy) to include as columns in the "
+                         "wide means CSV (default: energy dissipation, "
+                         "velocity, vorticity, mixed time, shear, power "
+                         "number, fluid volume, viscosity, density, rotation "
+                         "speed, angular velocity)")
     ap.add_argument("--plot", nargs="*", metavar="VAR", default=None,
                     help="write one interactive HTML of plots per stats file; "
                          "give variable names (fuzzy) to limit which are plotted, "
@@ -499,12 +564,21 @@ def main(argv=None):
             fail("no variables summarized in any case")
         out = args.output or args.case / "batch_summary.csv"
         write_csv(batch_rows, out, columns=["case"] + COLUMNS)
+        write_wide_csv(batch_rows, out.with_name(f"{out.stem}_means{out.suffix}"),
+                       args.means_vars or DEFAULT_MEANS_VARS,
+                       warn_unmatched=args.means_vars is not None)
     else:
         stats_dir = find_stats_dir(args.case)
+        base = args.case if args.case.is_dir() else args.case.parent
+        out = args.output or base / "stats_summary.csv"
         rows = process_case(args.case, stats_dir, args,
-                            output=args.output, plot_dir=args.plot_dir)
+                            output=out, plot_dir=args.plot_dir)
         if not rows:
             fail("no variables summarized")
+        write_wide_csv([{"case": args.case.name, **r} for r in rows],
+                       out.with_name(f"{out.stem}_means{out.suffix}"),
+                       args.means_vars or DEFAULT_MEANS_VARS,
+                       warn_unmatched=args.means_vars is not None)
     log("done")
 
 
