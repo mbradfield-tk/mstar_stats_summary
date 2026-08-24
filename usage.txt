@@ -56,7 +56,9 @@ OPTIONS
                         (default: energy dissipation, velocity, vorticity,
                         mixed time, shear, power number, fluid volume,
                         viscosity, density, rotation speed, angular
-                        velocity)
+                        velocity; with the default list, LB variables and
+                        Min/Max variants are excluded so only mean values
+                        are reported)
 
     --output PATH       Output CSV path.
                         (default: <case>/stats_summary.csv; with --batch,

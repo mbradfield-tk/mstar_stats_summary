@@ -287,19 +287,22 @@ DEFAULT_MEANS_VARS = [
     "power number", "fluid volume", "viscosity", "density",
     "rotation speed", "angular velocity",
 ]
+# with the default list, keep only mean values: drop LB and min/max variants
+DEFAULT_MEANS_EXCLUDE = r"\b(lb|min|max)\b"
 
 
-def write_wide_csv(batch_rows: list[dict], out_path: Path,
-                   queries: list[str], warn_unmatched: bool = True) -> None:
+def write_wide_csv(batch_rows: list[dict], out_path: Path, queries: list[str],
+                   warn_unmatched: bool = True, exclude: str | None = None) -> None:
     """One row per case, one 'variable [units]' column per variable, values = means.
 
-    Only variables fuzzy-matching one of the queries are included. Variables
-    tracked in more than one stats file are prefixed with the file name to
-    keep columns unique.
+    Only variables fuzzy-matching one of the queries (and not the exclude
+    regex) are included. Variables tracked in more than one stats file are
+    prefixed with the file name to keep columns unique.
     """
     qn = [q.strip().lower() for q in queries]
     rows = [r for r in batch_rows
-            if any(q in norm_name(r["variable"]) for q in qn)]
+            if any(q in norm_name(r["variable"]) for q in qn)
+            and not (exclude and re.search(exclude, norm_name(r["variable"])))]
     if warn_unmatched:
         for q in qn:
             if not any(q in norm_name(r["variable"]) for r in batch_rows):
@@ -566,7 +569,8 @@ def main(argv=None):
         write_csv(batch_rows, out, columns=["case"] + COLUMNS)
         write_wide_csv(batch_rows, out.with_name(f"{out.stem}_means{out.suffix}"),
                        args.means_vars or DEFAULT_MEANS_VARS,
-                       warn_unmatched=args.means_vars is not None)
+                       warn_unmatched=args.means_vars is not None,
+                       exclude=None if args.means_vars else DEFAULT_MEANS_EXCLUDE)
     else:
         stats_dir = find_stats_dir(args.case)
         base = args.case if args.case.is_dir() else args.case.parent
@@ -578,7 +582,8 @@ def main(argv=None):
         write_wide_csv([{"case": args.case.name, **r} for r in rows],
                        out.with_name(f"{out.stem}_means{out.suffix}"),
                        args.means_vars or DEFAULT_MEANS_VARS,
-                       warn_unmatched=args.means_vars is not None)
+                       warn_unmatched=args.means_vars is not None,
+                       exclude=None if args.means_vars else DEFAULT_MEANS_EXCLUDE)
     log("done")
 
 
