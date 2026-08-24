@@ -113,6 +113,12 @@ OUTPUT
                         Variables tracked in more than one stats file are
                         prefixed with the file name to keep columns unique.
 
+    stats_summary_means.html
+                        Bar plots of the means table: for each variable, the
+                        absolute values per case and the % difference vs the
+                        first case (reference). Written next to the means
+                        CSV (batch_summary_means.html with --batch).
+
     batch_summary.csv   (with --batch) Combined summary of all cases in the
                         parent directory, with a leading "case" column; each
                         case also gets its own stats_summary.csv.

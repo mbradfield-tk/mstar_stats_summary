@@ -343,6 +343,49 @@ def write_wide_csv(batch_rows: list[dict], out_path: Path, queries: list[str],
             w.writerow({"case": case, **vals})
     log(f"wrote {out_path} ({len(data)} cases x {len(cols)} variables)")
 
+    plot_means_bars(cols, data, out_path.with_suffix(".html"))
+
+
+def plot_means_bars(cols: list[str], data: dict[str, dict[str, object]],
+                    out_html: Path) -> None:
+    """Bar plots of the means table: absolute values and % difference vs the
+    first case (reference), one row of subplots per variable."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    cases = list(data)
+    ref = cases[0]
+    titles = []
+    for c in cols:
+        titles += [c, "% diff vs reference"]
+    n = len(cols)
+    fig = make_subplots(rows=n, cols=2, subplot_titles=titles,
+                        vertical_spacing=min(0.35 / n, 0.04),
+                        horizontal_spacing=0.08)
+
+    for i, col in enumerate(cols, 1):
+        ys = [v if isinstance(v, (int, float)) else np.nan
+              for v in (data[case].get(col) for case in cases)]
+        fig.add_trace(go.Bar(x=cases, y=ys, marker_color="steelblue",
+                             showlegend=False,
+                             hovertemplate="%{x}: %{y:.5g}<extra></extra>"),
+                      row=i, col=1)
+        ref_v = ys[0]
+        if np.isfinite(ref_v) and ref_v != 0:
+            rel = [(y - ref_v) / abs(ref_v) * 100 for y in ys]
+            fig.add_trace(go.Bar(x=cases, y=rel, marker_color="indianred",
+                                 showlegend=False,
+                                 hovertemplate="%{x}: %{y:.3g}%<extra></extra>"),
+                          row=i, col=2)
+            fig.update_yaxes(title_text="%", title_font_size=10, row=i, col=2)
+
+    fig.update_annotations(font_size=10)
+    fig.update_layout(
+        title=f"Steady-state means by case (reference case: {ref})",
+        height=max(400, 250 * n), template="plotly_white", margin=dict(t=90))
+    fig.write_html(str(out_html))
+    log(f"wrote {out_html} ({n} variables, {len(cases)} cases)")
+
 
 # ---------------------------------------------------------------- plots
 
