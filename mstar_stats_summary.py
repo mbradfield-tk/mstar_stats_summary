@@ -360,7 +360,7 @@ def plot_means_bars(cols: list[str], data: dict[str, dict[str, object]],
         titles += [c, "% diff vs reference"]
     n = len(cols)
     fig = make_subplots(rows=n, cols=2, subplot_titles=titles,
-                        vertical_spacing=min(0.35 / n, 0.04),
+                        vertical_spacing=min(0.6 / n, 0.3),
                         horizontal_spacing=0.08)
 
     for i, col in enumerate(cols, 1):
@@ -379,10 +379,11 @@ def plot_means_bars(cols: list[str], data: dict[str, dict[str, object]],
                           row=i, col=2)
             fig.update_yaxes(title_text="%", title_font_size=10, row=i, col=2)
 
+    fig.update_xaxes(tickfont_size=9, automargin=True)
     fig.update_annotations(font_size=10)
     fig.update_layout(
         title=f"Steady-state means by case (reference case: {ref})",
-        height=max(400, 250 * n), template="plotly_white", margin=dict(t=90))
+        height=max(400, 300 * n), template="plotly_white", margin=dict(t=90))
     fig.write_html(str(out_html))
     log(f"wrote {out_html} ({n} variables, {len(cases)} cases)")
 
