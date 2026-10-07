@@ -56,9 +56,10 @@ OPTIONS
                         (default: energy dissipation, velocity, vorticity,
                         mixed time, shear, power number, fluid volume,
                         viscosity, density, rotation speed, angular
-                        velocity; with the default list, LB variables and
-                        Min/Max variants are excluded so only mean values
-                        are reported)
+                        velocity, interfacial area, d32, dispersed
+                        fraction, n_drops, cov; with the default list, LB
+                        variables and Min/Max variants are excluded so
+                        only mean values are reported)
 
     --output PATH       Output CSV path.
                         (default: <case>/stats_summary.csv; with --batch,
@@ -75,6 +76,82 @@ OPTIONS
                         where plots go to <case>/stats_plots in each case)
 
     -h, --help          Show help message and exit.
+
+PHASE DISPERSION OPTIONS (Immiscible Two-Fluid)
+-----------------------------------------------
+    All opt-in. The VTK-based parts (VOF structures, uniformity) need
+    pyvista (pip install pyvista); without it they are skipped with a
+    warning. New summary rows are tagged in steady_method as interface,
+    vof, zonal or hinze.
+
+    --dispersion        Enable dispersion metrics:
+                        - from the interface stats file (name containing
+                          "interface"): specific interfacial area
+                          a(t) = A_int/V_liq [1/m] and area-based Sauter
+                          diameter d32(t) = 6*phi/a [m];
+                        - from the Volume VOF Surface .vtp files (name
+                          containing "VOF", Slice outputs excluded): per
+                          frame drop count n_drops, d32 = 6*sum(V)/sum(A),
+                          d10, d43, largest drop diameter, d32 excluding
+                          the largest structure, and dispersed fraction
+                          F_disp = 1 - V_largest/V_total. Only closed
+                          structures are counted (open/clipped ones, e.g. a
+                          bulk layer touching the walls, are reported as
+                          n_open). Frame times come from the 'TIME' field
+                          data, else from the filename;
+                        - with --voxel-size, --sigma and --rho-continuous:
+                          the Hinze resolution check (see --hinze-c).
+
+    --dispersed-fraction PHI
+                        Dispersed-phase volume fraction (0 < PHI < 1); the
+                        area-based d32 is skipped without it.
+
+    --liquid-volume M3  Liquid volume [m^3] for a = A_int/V_liq.
+                        (default: 'Fluid Volume' from Fluid.txt)
+
+    --vof-dir PATH      Directory searched recursively for the VOF surface
+                        .vtp files. (default: the case directory; with
+                        --batch, a relative path is taken per case)
+
+    --voxel-size M      Lattice spacing [m]. Structures smaller than
+                        --min-voxels voxels are dropped as numerical debris;
+                        without it all structures are kept.
+
+    --min-voxels N      Debris threshold in voxels. (default: 8)
+
+    --sigma S           Interfacial tension [N/m] for the resolution check.
+
+    --rho-continuous RHO
+                        Continuous-phase density [kg/m^3] for the
+                        resolution check.
+
+    --hinze-c C         Constant in the Hinze maximum stable drop size
+                        d_max = C*(sigma/rho_c)^0.6*eps^-0.4, with eps the
+                        steady mean energy dissipation rate [W/kg] from
+                        Fluid.txt. d_max/voxel size is reported; below 5
+                        a warning is issued that DSD/d32 reflect the grid
+                        scale (F_disp and holdup stay meaningful).
+                        (default: 0.725)
+
+    --uniformity        Zonal CoV and vertical holdup profile of the phase
+                        fraction from the 3D Volume .vti output (array name
+                        containing "vof", "phase" or "fraction"; a "solid"
+                        or "flag" array, if present, masks non-fluid
+                        voxels where nonzero). phi is averaged into
+                        axial x radial zones before the volume-weighted
+                        CoV = std/mean is computed.
+
+    --zones-z N         Number of axial zones. (default: 10)
+
+    --zones-r N         Number of radial zones. (default: 3)
+
+    --vertical-axis {x,y,z}
+                        Vessel axis / vertical direction. (default: y,
+                        M-Star's up direction)
+
+    --axis-center A B   Vessel-axis position in the two horizontal
+                        coordinates (x z for a y axis).
+                        (default: domain center)
 
 EXAMPLES
 --------
@@ -96,6 +173,55 @@ EXAMPLES
 
     # Bulk-process every case subfolder under runs/
     python mstar_stats_summary.py runs --batch
+
+    # Phase-dispersion metrics with resolution check and plots
+    python mstar_stats_summary.py case --dispersion --dispersed-fraction 0.2 \
+        --voxel-size 5e-4 --sigma 0.05 --rho-continuous 998 --plot
+
+    # Spatial uniformity of the phase fraction
+    python mstar_stats_summary.py case --uniformity --zones-z 10 --zones-r 3
+
+IMMISCIBLE TWO-FLUID EXAMPLE
+----------------------------
+    Case: 0.27 L liquid-liquid system with 30 vol% dispersed phase,
+    lattice spacing 0.372 mm, interfacial tension 0.03 N/m, continuous
+    phase water. The VOF surface and volume output must be enabled in
+    M-Star (Output/VolumeVOFSurface/*.vtp; a VOF/phase-fraction array in
+    Output/Volume/*.vti for --uniformity).
+
+    # one-time setup
+    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+    source .venv/bin/activate
+
+    # all dispersion metrics, uniformity and plots for one case
+    python mstar_stats_summary.py SF-031_EM402_350rpm_0.27L \
+        --dispersion --dispersed-fraction 0.3 \
+        --voxel-size 3.72e-4 --min-voxels 8 \
+        --sigma 0.03 --rho-continuous 998 \
+        --uniformity --zones-z 10 --zones-r 3 \
+        --plot "mean velocity" "energy dissipation"
+
+    Writes, in the case folder:
+        stats_summary.csv      + rows: Specific Interfacial Area, Sauter
+                               Diameter d32 (interface / VOF), n_drops,
+                               F_disp, Zonal CoV, Hinze drop size / voxel
+        vof_structures.csv     per-frame drop statistics
+        vof_dsd.csv            per-frame drop diameters
+        phase_uniformity.csv   per-frame zonal CoV
+        holdup_profile.csv     per-frame phi(z)
+        stats_plots/dispersion.html
+
+    # interfacial-area metrics only (no VTK output or pyvista needed),
+    # with an explicit liquid volume
+    python mstar_stats_summary.py SF-031_EM402_350rpm_0.27L \
+        --dispersion --dispersed-fraction 0.3 --liquid-volume 2.7e-4
+
+    # compare all cases of a study; d32, interfacial area, F_disp,
+    # n_drops and CoV appear as columns in batch_summary_means.csv/.html
+    # (the same --dispersed-fraction is applied to every case)
+    python mstar_stats_summary.py TAK-495_EM402_20260824 --batch \
+        --dispersion --dispersed-fraction 0.3 --voxel-size 3.72e-4 \
+        --sigma 0.03 --rho-continuous 998 --uniformity --plot
 
 OUTPUT
 ------
@@ -126,3 +252,22 @@ OUTPUT
     batch_summary_means.csv
                         (with --batch) Same wide means table across all
                         cases in the batch.
+
+    vof_structures.csv  (with --dispersion) Per VOF frame: region, open and
+                        debris counts, n_drops, d32, d10, d43, d_max,
+                        d32 excluding the largest structure, F_disp.
+
+    vof_dsd.csv         (with --dispersion) Per frame and kept structure:
+                        time, region id, equivalent diameter, volume, area.
+
+    phase_uniformity.csv
+                        (with --uniformity) Per frame: zonal CoV and mean phi.
+
+    holdup_profile.csv  (with --uniformity) Per frame: phi averaged over
+                        each horizontal voxel layer, phi(z).
+
+    stats_plots/dispersion.html
+                        (with --plot and --dispersion/--uniformity) a(t),
+                        d32(t) from both methods, F_disp(t), n_drops(t),
+                        CoV(t), steady-state DSD histogram (number and
+                        volume weighted) and phi(z, t) heatmap.
