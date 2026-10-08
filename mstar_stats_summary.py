@@ -13,12 +13,15 @@ the concentration RSD last drops below 5%, measured from tracer injection
 Optional phase-dispersion metrics for Immiscible Two-Fluid simulations
 (require pyvista for the VTK-based parts; skipped with a warning otherwise):
   --dispersion  specific interfacial area a = A_int/V_liq and area-based
-                d32 = 6*phi/a from the interface stats file; drop size
-                distribution, d32/d10/d43, drop count and dispersed fraction
-                F_disp = 1 - V_largest/V_total from the Volume VOF Surface
-                .vtp output (vof_structures.csv, vof_dsd.csv); with --sigma,
-                --rho-continuous and --voxel-size also a Hinze drop-size
-                resolution check.
+                d32 = 6*phi/a from the interface stats file; per-fluid drop
+                statistics from the Volume VOF Surface .vtp output
+                (vof_structures.csv, vof_dsd.csv): closed drops are assigned
+                to the fluid inside them (from the .vti volume fraction),
+                giving n_drops, d32, d32/dx, d10/d43 and F_disp = V_drops/V_fluid
+                per fluid, plus the interface coverage A_drops/A_int; skipped
+                for free-surface cases. Needs the voxel size (--voxel-size or
+                <dx> in input.xml); with --sigma and --rho-continuous also a
+                Hinze drop-size resolution check.
   --uniformity  zonal coefficient of variation of the phase fraction and the
                 vertical holdup profile from the 3D Volume .vti output
                 (phase_uniformity.csv, holdup_profile.csv).
@@ -305,6 +308,7 @@ DEFAULT_MEANS_VARS = [
     "power number", "fluid volume", "viscosity", "density",
     "rotation speed", "angular velocity",
     "interfacial area", "d32", "dispersed fraction", "n_drops", "cov",
+    "coverage", "hinze",
 ]
 # with the default list, keep only mean values: drop LB and min/max variants
 DEFAULT_MEANS_EXCLUDE = r"\b(lb|min|max)\b"
@@ -493,7 +497,7 @@ def interface_metrics(files: list[Path], stats_dir: Path, t_start: float,
             return [], {}
     a = np.full_like(t, np.nan)
     np.divide(area, vol, out=a, where=vol > 0)
-    series = {"t": t, "a": a}
+    series = {"t": t, "a": a, "area": area}
     rows = [series_row(rel, "Specific Interfacial Area [1/m]", t, a, t_start, "interface")]
 
     if phi is None:
@@ -539,26 +543,101 @@ def frame_time(mesh, t_name: float | None) -> tuple[float | None, str]:
     return t_name, "filename"
 
 
-def analyze_vof_surface(pv, surf) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
-    """Per-structure volume, area and closedness of a VOF iso-surface.
+def fluid_volumes(files: list[Path]) -> list[tuple[int, str, np.ndarray, np.ndarray]]:
+    """Per-fluid volumes from the 'Fluid N (name) Volume' columns of Fluid.txt,
+    as [(N, name, t, V)] sorted by N; empty for free-surface/single-fluid cases."""
+    fluid = [f for f in files if f.name.lower() == "fluid.txt"]
+    table = load_stats_table(fluid[0]) if fluid else None
+    if table is None:
+        return []
+    header, data = table
+    out = []
+    for j, h in enumerate(header):
+        m = re.match(r"\s*fluid\s*(\d+)\s*\((.*?)\)\s*volume\s*(\[[^\]]*\])?\s*$", h, re.I)
+        if m:
+            ok = np.isfinite(data[:, 0]) & np.isfinite(data[:, j])
+            out.append((int(m.group(1)), m.group(2).strip() or f"Fluid {m.group(1)}",
+                        data[ok, 0], data[ok, j]))
+    return sorted(out, key=lambda x: x[0])
+
+
+def input_voxel_size(base: Path) -> float | None:
+    """Lattice spacing <dx> from the M-Star input.xml in or above the case dir."""
+    for d in [base, *list(base.parents)[:2]]:
+        p = d / "input.xml"
+        if p.is_file():
+            m = re.search(r"<dx>\s*([-+0-9.eE]+)\s*</dx>", p.read_text(errors="replace"))
+            if m:
+                return float(m.group(1))
+    return None
+
+
+def vti_sampler(pv, paths: list[Path], fluid_idx: int):
+    """Point sampler of the 'Fluid <fluid_idx> ... Volume Fraction' cell array of
+    the (multi-block) .vti volume output; None if the array is missing."""
+    pat = re.compile(rf"fluid\s*{fluid_idx}\b.*volume fraction", re.I)
+    blocks = []
+    for p in paths:
+        reader = pv.get_reader(str(p))
+        name = next((n for n in reader.cell_array_names if pat.search(n)), None)
+        if name is None:
+            continue
+        reader.disable_all_cell_arrays()
+        reader.disable_all_point_arrays()
+        reader.enable_cell_array(name)
+        mesh = reader.read()
+        dims = np.array(mesh.dimensions) - 1
+        blocks.append((np.array(mesh.origin), np.array(mesh.spacing), dims,
+                       np.asarray(mesh.cell_data[name], float).reshape(dims[::-1])))
+    if not blocks:
+        return None
+
+    def sample(pts: np.ndarray) -> np.ndarray:
+        out = np.full(len(pts), np.nan)
+        for origin, spacing, dims, arr in blocks:
+            ijk = np.floor((pts - origin) / spacing).astype(int)
+            ok = np.all((ijk >= 0) & (ijk < dims), axis=1) & np.isnan(out)
+            i, j, k = ijk[ok].T
+            out[ok] = arr[k, j, i]
+        return out
+    return sample
+
+
+def analyze_vof_surface(pv, surf, sampler=None, voxel_size: float | None = None,
+                        n_samples: int = 25) -> dict:
+    """Per-structure volume, area, closedness and inside fluid of a VOF iso-surface.
 
     Degenerate triangles (M-Star pads its output with them) are dropped and
-    duplicate points merged. Structures come from an M-Star structure/region
+    duplicate points merged (within 1e-3 voxels, so drops crossing block
+    seams stay closed). Structures come from an M-Star structure/region
     ID array if present, else from connectivity. Volume uses the divergence
     theorem; a structure is closed if no edge belongs to only one triangle.
-    Vectorized equivalent of extract_surface()/volume/area/n_open_edges per region.
+
+    "inside" is the fluid-1 volume fraction inside each closed structure
+    (NaN for open ones): sampler(points) at up to n_samples points just inside
+    its surface, or, without a sampler, from the triangle orientation (M-Star
+    orients the iso-surface normals toward fluid 2).
+    Returns {"vol", "area", "closed", "inside", "signed", "source"}.
     """
     empty = np.zeros(0)
+    none = {"vol": empty, "area": empty, "closed": empty.astype(bool),
+            "inside": empty, "signed": empty, "source": "none"}
     if surf.n_cells == 0:
-        return empty, empty, empty.astype(bool), "none"
+        return none
     if not surf.is_all_triangles:
         surf = surf.triangulate()
     f = surf.faces.reshape(-1, 4)[:, 1:]
-    pts, merge = np.unique(np.asarray(surf.points), axis=0, return_inverse=True)
+    raw = np.asarray(surf.points, float)
+    if voxel_size:
+        q = np.round(raw / (1e-3 * voxel_size)).astype(np.int64)
+        _, first, merge = np.unique(q, axis=0, return_index=True, return_inverse=True)
+        pts = raw[first]
+    else:
+        pts, merge = np.unique(raw, axis=0, return_inverse=True)
     f = merge.ravel()[f]
     keep = (f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])
     if not keep.any():
-        return empty, empty, empty.astype(bool), "none"
+        return none
     mesh = pv.PolyData(pts, np.c_[np.full(keep.sum(), 3), f[keep]].ravel())
 
     id_name = None
@@ -587,56 +666,89 @@ def analyze_vof_surface(pv, surf) -> tuple[np.ndarray, np.ndarray, np.ndarray, s
     F = mesh.faces.reshape(-1, 4)[:, 1:]
     P = np.asarray(mesh.points, float)
     p0, p1, p2 = P[F[:, 0]], P[F[:, 1]], P[F[:, 2]]
-    vol = np.abs(np.bincount(rid, np.einsum("ij,ij->i", p0, np.cross(p1, p2)) / 6.0, n))
-    area = np.bincount(rid, 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1), n)
+    signed = np.bincount(rid, np.einsum("ij,ij->i", p0, np.cross(p1, p2)) / 6.0, n)
+    vol = np.abs(signed)
+    nrm = np.cross(p1 - p0, p2 - p0)
+    area = np.bincount(rid, 0.5 * np.linalg.norm(nrm, axis=1), n)
 
     edges = np.sort(np.r_[F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]], axis=1).astype(np.int64)
     key = edges[:, 0] * mesh.n_points + edges[:, 1]
     _, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
     open_struct = np.zeros(n, bool)
     open_struct[np.tile(rid, 3)[cnt[inv.ravel()] == 1]] = True
-    return vol, area, ~open_struct, source
+    closed = ~open_struct
+
+    # positive signed volume = outward normals = fluid 2 outside = fluid-1 drop
+    inside = np.where(closed, (signed > 0).astype(float), np.nan)
+    if sampler is not None and closed.any():
+        fc = np.flatnonzero(closed[rid])
+        order = fc[np.argsort(rid[fc], kind="stable")]
+        r = rid[order]
+        pick = order[np.arange(r.size) - np.searchsorted(r, r) < n_samples]
+        rp = rid[pick]
+        unit = nrm[pick] / np.maximum(np.linalg.norm(nrm[pick], axis=1, keepdims=True), 1e-300)
+        outward = np.sign(signed[rp])[:, None] * unit
+        depth = 0.25 * (6.0 * vol[rp] / np.pi) ** (1.0 / 3.0)
+        if voxel_size:
+            depth = np.minimum(depth, voxel_size)
+        s = sampler((p0[pick] + p1[pick] + p2[pick]) / 3.0 - outward * depth[:, None])
+        ok = np.isfinite(s)
+        cnt_s = np.bincount(rp[ok], minlength=n)
+        tot = np.bincount(rp[ok], s[ok], n)
+        has = closed & (cnt_s > 0)
+        inside[has] = tot[has] / cnt_s[has]
+    return {"vol": vol, "area": area, "closed": closed, "inside": inside,
+            "signed": signed, "source": source}
 
 
-VOF_METRICS = [  # (time-series CSV column, summary variable)
-    ("n_drops", "Number of Drops n_drops [-]"),
-    ("d32_m", "Sauter Diameter d32 (VOF) [m]"),
-    ("d10_m", "Mean Drop Diameter d10 (VOF) [m]"),
-    ("d43_m", "Volume-Mean Drop Diameter d43 (VOF) [m]"),
-    ("d_max_m", "Largest Drop Diameter (VOF) [m]"),
-    ("d32_excl_largest_m", "Sauter Diameter d32 excl. Largest (VOF) [m]"),
-    ("F_disp", "Dispersed Fraction F_disp [-]"),
+PHASE_METRICS = [  # (per-fluid time-series CSV column, summary variable template)
+    ("n_drops", "Number of Drops n_drops ({} drops) [-]"),
+    ("d32_m", "Sauter Diameter d32 (VOF, {} drops) [m]"),
+    ("d32_dx", "Sauter Diameter d32 / Voxel Size (VOF, {} drops) [-]"),
+    ("d10_m", "Mean Drop Diameter d10 (VOF, {} drops) [m]"),
+    ("d43_m", "Volume-Mean Drop Diameter d43 (VOF, {} drops) [m]"),
+    ("d_max_m", "Largest Drop Diameter (VOF, {} drops) [m]"),
+    ("F_disp", "Dispersed Fraction F_disp ({} in drops / {} volume) [-]"),
 ]
 
 
-def vof_structures(case_dir: Path, min_voxels: float, voxel_size: float | None,
-                   t_start: float, out_dir: Path | None = None) -> tuple[list[dict], dict]:
-    """Drop size distribution and dispersed fraction from Volume VOF Surface .vtp files.
+def vof_structures(case_dir: Path, min_voxels: float, voxel_size: float,
+                   t_start: float, fluids: list[tuple[int, str, np.ndarray, np.ndarray]],
+                   a_int: tuple[np.ndarray, np.ndarray] | None = None,
+                   out_dir: Path | None = None) -> tuple[list[dict], dict]:
+    """Per-fluid drop statistics from the Volume VOF Surface .vtp files.
 
-    Only closed structures (not clipped by walls/domain) are counted, and
-    structures smaller than min_voxels * voxel_size^3 are dropped as debris.
-    Writes vof_structures.csv and vof_dsd.csv to out_dir (default case_dir).
-    Returns (summary rows, {"t", <metric columns>, "dsd"} for plotting).
+    Drops are closed structures (bulk phases touching walls/shaft/impeller are
+    open and excluded) of at least min_voxels voxels. Each drop is assigned to
+    the fluid inside it, sampled from the .vti volume output at the same time
+    (else from the triangle orientation). Per fluid k (fluids = the two
+    fluid_volumes() entries): n_drops, d32, d32/dx, d10, d43, d_max and
+    F_disp,k = V_drops,k / V_k. With a_int = (t, A_int) from the interface stats
+    file, coverage = A_drops / A_int is the share of the interface the drop
+    statistics describe. Writes vof_structures.csv and vof_dsd.csv to out_dir.
+    Returns (summary rows, plot series).
     """
     pv = import_pyvista("VOF structure analysis")
     if pv is None:
         return [], {}
-    frames = find_frames(case_dir, ".vtp", lambda n: "vof" in n)
+    # VolumeVOFStructures/vof_structures.*.vtp is a point cloud, not the surface
+    frames = find_frames(case_dir, ".vtp", lambda n: "vof" in n and "structure" not in n)
     if not frames:
         warn(f"--dispersion: no VOF surface .vtp files (name containing 'VOF', "
              f"excluding Slice outputs) found under {case_dir}; skipping VOF structures")
         return [], {}
     log(f"VOF structures: {len(frames)} frame(s) under {case_dir}")
-    if voxel_size:
-        v_min = min_voxels * voxel_size ** 3
-        log(f"  debris filter: V < {min_voxels:g} voxels = {v_min:.3g} m^3")
-    else:
-        v_min = 0.0
-        warn("--dispersion: --voxel-size not given; keeping all VOF structures "
-             "(no debris filter)")
+    v_min = min_voxels * voxel_size ** 3
+    log(f"  debris filter: V < {min_voxels:g} voxels = {v_min:.3g} m^3")
+    vti_frames = [(tv, p) for tv, p in find_frames(case_dir, ".vti") if tv is not None]
+    idx1 = fluids[0][0]
+    # label by fluid index so batch columns line up across fluid systems
+    phases = [(f"fluid{i}", f"Fluid {i}", ft, fv) for i, _, ft, fv in fluids]
+    log("  phases: " + ", ".join(f"Fluid {i} = {name}" for i, name, *_ in fluids))
 
     ts_rows, dsd_rows, dsd_plot = [], [], []
-    sources, id_sources, n_open_frames = set(), set(), 0
+    sources, id_sources, phase_sources = set(), set(), set()
+    n_blocks, n_checked, n_disagree = 1, 0, 0
     for t_name, paths in frames:
         meshes = [pv.read(p) for p in paths]
         t, src = frame_time(meshes[0], t_name)
@@ -644,37 +756,53 @@ def vof_structures(case_dir: Path, min_voxels: float, voxel_size: float | None,
             warn(f"  {paths[0].name}: no time in field data or filename; skipped")
             continue
         sources.add(src)
+        n_blocks = max(n_blocks, len(meshes))
         surf = meshes[0] if len(meshes) == 1 else pv.merge(meshes)
-        vol, area, closed, id_src = analyze_vof_surface(pv, surf)
-        id_sources.add(id_src)
+        vti = next((p for tv, p in vti_frames
+                    if abs(tv - t) <= 1e-6 * max(1.0, abs(t))), None)
+        sampler = vti_sampler(pv, vti, idx1) if vti else None
+        phase_sources.add(f"fluid-{idx1} volume fraction in .vti" if sampler
+                          else "triangle orientation (no matching .vti)")
+        s = analyze_vof_surface(pv, surf, sampler, voxel_size)
+        id_sources.add(s["source"])
+        vol, area, closed = s["vol"], s["area"], s["closed"]
 
-        n_open = int((~closed).sum())
-        n_open_frames += n_open > 0
         debris = closed & (vol < v_min)
         kept = closed & ~debris
-        V, A = vol[kept], area[kept]
-        d = (6.0 * V / np.pi) ** (1.0 / 3.0)
-        rec = {"time_s": t, "n_regions": len(vol), "n_open": n_open,
-               "n_debris": int(debris.sum()), "n_drops": int(kept.sum()),
-               "V_total_m3": float(V.sum())}
-        if V.size:
-            big = int(np.argmax(V))
-            rest = np.arange(V.size) != big
-            rec.update({
-                "d32_m": 6.0 * V.sum() / A.sum(),
-                "d10_m": float(d.mean()),
-                "d43_m": float((d ** 4).sum() / (d ** 3).sum()),
-                "d_max_m": float(d.max()),
-                "d32_excl_largest_m": (6.0 * V[rest].sum() / A[rest].sum()
-                                       if rest.any() else np.nan),
-                "F_disp": 1.0 - V[big] / V.sum(),
-            })
-            for i, gid in enumerate(np.flatnonzero(kept)):
-                dsd_rows.append({"time_s": t, "region_id": int(gid), "d_eq_m": d[i],
-                                 "volume_m3": V[i], "area_m2": A[i]})
-                dsd_plot.append((t, d[i], V[i], i == big))
-        else:
-            rec.update({k: np.nan for k, _ in VOF_METRICS if k != "n_drops"})
+        is1 = s["inside"] > 0.5
+        if sampler:
+            n_checked += int(kept.sum())
+            n_disagree += int((kept & (is1 != (s["signed"] > 0))).sum())
+        a_drops = float(area[kept].sum())
+        rec = {"time_s": t, "n_regions": len(vol), "n_open": int((~closed).sum()),
+               "n_debris": int(debris.sum()), "A_surface_m2": float(area.sum()),
+               "A_drops_m2": a_drops, "coverage": np.nan}
+        if a_int is not None:
+            a_tot = float(np.interp(t, *a_int))
+            rec["A_int_m2"] = a_tot
+            if a_tot > 0:
+                rec["coverage"] = a_drops / a_tot
+        for k, (tag, name, ft, fv) in enumerate(phases):
+            sel = kept & (is1 if k == 0 else ~is1)
+            V, A = vol[sel], area[sel]
+            d = (6.0 * V / np.pi) ** (1.0 / 3.0)
+            v_phase = float(np.interp(t, ft, fv))
+            rec[f"n_drops_{tag}"] = int(sel.sum())
+            rec[f"V_drops_m3_{tag}"] = float(V.sum())
+            rec[f"F_disp_{tag}"] = V.sum() / v_phase if v_phase > 0 else np.nan
+            if V.size:
+                d32 = 6.0 * V.sum() / A.sum()
+                rec.update({f"d32_m_{tag}": d32, f"d32_dx_{tag}": d32 / voxel_size,
+                            f"d10_m_{tag}": float(d.mean()),
+                            f"d43_m_{tag}": float((d ** 4).sum() / (d ** 3).sum()),
+                            f"d_max_m_{tag}": float(d.max())})
+            else:
+                rec.update({f"{c}_{tag}": np.nan for c in ("d32_m", "d32_dx", "d10_m",
+                                                            "d43_m", "d_max_m")})
+            for gid, di, vi, ai in zip(np.flatnonzero(sel), d, V, A):
+                dsd_rows.append({"time_s": t, "phase": name, "region_id": int(gid),
+                                 "d_eq_m": di, "volume_m3": vi, "area_m2": ai})
+                dsd_plot.append((t, di, vi, name))
         ts_rows.append(rec)
     if not ts_rows:
         return [], {}
@@ -682,28 +810,50 @@ def vof_structures(case_dir: Path, min_voxels: float, voxel_size: float | None,
     ts_rows.sort(key=lambda r: r["time_s"])
     log(f"  frame time taken from: {', '.join(sorted(sources))}")
     log(f"  structures identified by: {', '.join(sorted(id_sources))}")
-    if n_open_frames:
-        warn(f"  {n_open_frames} frame(s) contain open (clipped) structures, e.g. "
-             "a bulk layer touching walls; these are excluded, so d32/F_disp "
-             "refer to closed structures only")
+    log(f"  drop phase from: {', '.join(sorted(phase_sources))}")
+    if n_checked:
+        msg = (f"  .vti phase disagrees with triangle orientation for "
+               f"{n_disagree} of {n_checked} drops")
+        (warn if n_disagree > 0.05 * n_checked else log)(msg)
+    mean_open = np.mean([r["n_open"] for r in ts_rows])
+    log(f"  open structures (bulk phases, wall-attached drops/ligaments; excluded): "
+        f"{mean_open:.1f} per frame on average")
+    if n_blocks > 1:
+        warn(f"  VOF surface written in up to {n_blocks} blocks per frame; drops "
+             "crossing block seams whose vertices do not coincide are open and "
+             "excluded, biasing d32 toward small drops")
 
     out_dir = out_dir or case_dir
-    cols = ["time_s", "n_regions", "n_open", "n_debris", "n_drops"] \
-        + [k for k, _ in VOF_METRICS if k != "n_drops"] + ["V_total_m3"]
+    cols = ["time_s", "n_regions", "n_open", "n_debris", "A_surface_m2", "A_drops_m2"] \
+        + (["A_int_m2"] if a_int is not None else []) + ["coverage"] \
+        + [f"{c}_{tag}" for tag, *_ in phases
+           for c in ("n_drops", "V_drops_m3", "F_disp", "d32_m", "d32_dx",
+                     "d10_m", "d43_m", "d_max_m")]
     write_csv(ts_rows, out_dir / "vof_structures.csv", columns=cols, what="frames")
     write_csv(dsd_rows, out_dir / "vof_dsd.csv",
-              columns=["time_s", "region_id", "d_eq_m", "volume_m3", "area_m2"],
+              columns=["time_s", "phase", "region_id", "d_eq_m", "volume_m3", "area_m2"],
               what="structures")
 
     t = np.array([r["time_s"] for r in ts_rows])
-    series = {"t": t, "dsd": dsd_plot}
+    series = {"t": t, "dsd": dsd_plot, "phases": [(tag, name) for tag, name, *_ in phases]}
+    for c in cols[1:]:
+        series[c] = np.array([r.get(c, np.nan) for r in ts_rows], float)
     rows = []
-    for key, var in VOF_METRICS:
-        series[key] = np.array([r.get(key, np.nan) for r in ts_rows], float)
+    metrics = [(f"{key}_{tag}", var.format(name, name))
+               for tag, name, *_ in phases for key, var in PHASE_METRICS]
+    if a_int is not None:
+        metrics.append(("coverage", "Drop Interface Coverage A_drops/A_int [-]"))
+    for key, var in metrics:
         row = series_row("vof_structures.csv", var, t, series[key], t_start, "vof")
         if row:
             rows.append(row)
             log(f"  {var}: {row['mean']:.5g} \u00b1 {row['std']:.3g}")
+            if key == "coverage" and row["mean"] < 0.1:
+                warn(f"  closed drops carry only {100 * row['mean']:.2g}% of the "
+                     "interfacial area (rest: bulk interface, ligaments, "
+                     "wall-attached structures); drop statistics describe a small "
+                     "part of the dispersion, compare cases by the specific "
+                     "interfacial area a")
     return rows, series
 
 
@@ -719,7 +869,7 @@ def phase_uniformity(case_dir: Path, n_zones_z: int, n_zones_r: int, t_start: fl
     pv = import_pyvista("phase uniformity analysis")
     if pv is None:
         return [], {}
-    frames = find_frames(case_dir, ".vti")
+    frames = find_frames(case_dir, ".vti", lambda n: not n.startswith("boundaryconditions"))
     if not frames:
         warn(f"--uniformity: no .vti volume files found under {case_dir}; skipping")
         return [], {}
@@ -729,6 +879,9 @@ def phase_uniformity(case_dir: Path, n_zones_z: int, n_zones_r: int, t_start: fl
         f"vertical axis {vertical_axis}, {n_zones_z} x {n_zones_r} zones")
 
     phi_name = mask_name = None
+    frac_names: list[str] = []
+    phases: list[tuple[str, str, str]] = []  # (array, column suffix, label)
+    seen: dict[str, list[str]] = {}
     cov_rows, prof_rows, sources = [], [], set()
     for t_name, paths in frames:
         blocks = []  # (phi, vertical coord, radius) over fluid voxels
@@ -740,28 +893,37 @@ def phase_uniformity(case_dir: Path, n_zones_z: int, n_zones_r: int, t_start: fl
             names = cell_names + list(reader.point_array_names)
             if phi_name is None:
                 cands = [n for n in names
-                         if any(k in n.lower() for k in ("vof", "phase", "fraction"))]
+                         if any(k in n.lower() for k in ("vof", "phase", "fraction"))
+                         and "structure" not in n.lower()]
                 if not cands:
-                    warn(f"--uniformity: no phase-fraction array (name containing "
-                         f"'vof', 'phase' or 'fraction') in {p.name}; available: "
-                         + ", ".join(names))
-                    return [], {}
-                if len(cands) > 1:
-                    warn(f"--uniformity: ambiguous phase-fraction arrays "
-                         f"{cands}; using '{cands[0]}'")
-                phi_name = cands[0]
+                    seen.setdefault(p.parent.parent.name, names)
+                    continue
                 masks = [n for n in names if any(k in n.lower() for k in ("solid", "flag"))]
                 mask_name = masks[0] if masks else None
-                log(f"  phase fraction: '{phi_name}'"
-                    + (f", non-fluid mask: '{mask_name}' (nonzero = solid)" if mask_name else ""))
+                frac_names = [n for n in cell_names
+                              if re.search(r"fluid\s*\d+.*volume fraction", n, re.I)]
+                if len(frac_names) >= 2:
+                    for n in frac_names:
+                        i = re.search(r"fluid\s*(\d+)", n, re.I).group(1)
+                        phases.append((n, f"_fluid{i}", f"Fluid {i}"))
+                else:
+                    if len(cands) > 1:
+                        warn(f"--uniformity: ambiguous phase-fraction arrays "
+                             f"{cands}; using '{cands[0]}'")
+                    phases.append((cands[0], "", ""))
+                    if mask_name is None:
+                        frac_names = []
+                phi_name = phases[0][0]
+                log(f"  phase fraction: " + ", ".join(f"'{n}'" for n, *_ in phases)
+                    + f" from {p.parent.parent.name}"
+                    + (f", non-fluid mask: '{mask_name}' (nonzero = solid)" if mask_name
+                       else ", non-fluid mask: sum of fluid volume fractions < 0.5"
+                       if frac_names else ""))
             if phi_name not in names:
-                warn(f"  {p.name}: no '{phi_name}' array; skipped")
                 continue
             reader.disable_all_cell_arrays()
             reader.disable_all_point_arrays()
-            for n in (phi_name, mask_name):
-                if n is None:
-                    continue
+            for n in {mask_name, *frac_names, *(n for n, *_ in phases)} - {None}:
                 (reader.enable_cell_array if n in cell_names else reader.enable_point_array)(n)
             mesh = reader.read()
             t, src = frame_time(mesh, t_name)
@@ -772,10 +934,14 @@ def phase_uniformity(case_dir: Path, n_zones_z: int, n_zones_r: int, t_start: fl
             off = 0.5 if on_cells else 0.0
             data = mesh.cell_data if on_cells else mesh.point_data
             shape = tuple(dims[::-1])  # VTK order: x fastest
-            phi = np.asarray(data[phi_name], float).reshape(shape)
-            fluid = np.isfinite(phi)
+            phi = np.stack([np.asarray(data[n], float).reshape(shape) for n, *_ in phases])
+            fluid = np.isfinite(phi).all(axis=0)
             if mask_name is not None and mask_name in data.keys():
                 fluid &= np.asarray(data[mask_name]).reshape(shape) == 0
+            elif frac_names and all(n in data.keys() for n in frac_names):
+                # M-Star writes no solid flag; solid cells have all fluid fractions = 0
+                total = sum(np.asarray(data[n], float) for n in frac_names)
+                fluid &= total.reshape(shape) > 0.5
             c1d = [mesh.origin[a] + (np.arange(dims[a]) + off) * mesh.spacing[a]
                    for a in range(3)]
             zz, yy, xx = np.meshgrid(c1d[2], c1d[1], c1d[0], indexing="ij", sparse=True)
@@ -793,12 +959,12 @@ def phase_uniformity(case_dir: Path, n_zones_z: int, n_zones_r: int, t_start: fl
             c2 = (b[:, 2 * h2].min() + b[:, 2 * h2 + 1].max()) / 2
         ph, vz, rr = [], [], []
         for phi, coord, fluid, dz in blocks:
-            ph.append(phi[fluid])
-            vz.append(np.broadcast_to(coord[ax], phi.shape)[fluid])
+            ph.append(phi[:, fluid])
+            vz.append(np.broadcast_to(coord[ax], fluid.shape)[fluid])
             rr.append(np.broadcast_to(np.sqrt((coord[h1] - c1) ** 2 + (coord[h2] - c2) ** 2),
-                                      phi.shape)[fluid])
-        ph, vz, rr = np.concatenate(ph), np.concatenate(vz), np.concatenate(rr)
-        if ph.size == 0:
+                                      fluid.shape)[fluid])
+        ph, vz, rr = np.concatenate(ph, axis=1), np.concatenate(vz), np.concatenate(rr)
+        if vz.size == 0:
             warn(f"  t = {t:g} s: no fluid voxels; skipped")
             continue
 
@@ -809,40 +975,55 @@ def phase_uniformity(case_dir: Path, n_zones_z: int, n_zones_r: int, t_start: fl
         zone = iz * n_zones_r + ir
         nz = n_zones_z * n_zones_r
         w = np.bincount(zone, minlength=nz).astype(float)
-        s = np.bincount(zone, ph, minlength=nz)
         occ = w > 0
-        phi_zone = s[occ] / w[occ]
-        mean = np.average(phi_zone, weights=w[occ])
-        std = np.sqrt(np.average((phi_zone - mean) ** 2, weights=w[occ]))
-        cov_rows.append({"time_s": t, "cov": std / mean if mean else np.nan,
-                         "phi_mean": mean, "n_zones": int(occ.sum())})
-
         layer = np.rint((vz - vz.min()) / dz).astype(int)
         lw = np.bincount(layer)
-        lsum = np.bincount(layer, ph)
-        for k in np.flatnonzero(lw):
-            prof_rows.append({"time_s": t, "z_m": vz.min() + k * dz,
-                              "phi_mean": lsum[k] / lw[k]})
+        rec = {"time_s": t, "n_zones": int(occ.sum())}
+        prof = {k: {"time_s": t, "z_m": vz.min() + k * dz} for k in np.flatnonzero(lw)}
+        for (_, sfx, _), p in zip(phases, ph):
+            phi_zone = np.bincount(zone, p, minlength=nz)[occ] / w[occ]
+            mean = np.average(phi_zone, weights=w[occ])
+            std = np.sqrt(np.average((phi_zone - mean) ** 2, weights=w[occ]))
+            rec[f"cov{sfx}"] = std / mean if mean else np.nan
+            rec[f"phi_mean{sfx}"] = mean
+            lsum = np.bincount(layer, p)
+            for k, r in prof.items():
+                r[f"phi_mean{sfx}"] = lsum[k] / lw[k]
+        cov_rows.append(rec)
+        prof_rows.extend(prof.values())
+    if phi_name is None:
+        warn("--uniformity: no phase-fraction array (name containing 'vof', 'phase' "
+             "or 'fraction') in any .vti output; enable the volume fraction in the "
+             "M-Star Volume output. Found: "
+             + "; ".join(f"{d}: {', '.join(n)}" for d, n in seen.items()))
+        return [], {}
     if not cov_rows:
         return [], {}
 
     cov_rows.sort(key=lambda r: r["time_s"])
     log(f"  frame time taken from: {', '.join(sorted(sources))}")
     out_dir = out_dir or case_dir
+    sfxs = [sfx for _, sfx, _ in phases]
     write_csv(cov_rows, out_dir / "phase_uniformity.csv",
-              columns=["time_s", "cov", "phi_mean", "n_zones"], what="frames")
+              columns=["time_s"] + [f"{c}{s}" for s in sfxs for c in ("cov", "phi_mean")]
+              + ["n_zones"], what="frames")
     write_csv(prof_rows, out_dir / "holdup_profile.csv",
-              columns=["time_s", "z_m", "phi_mean"], what="rows")
+              columns=["time_s", "z_m"] + [f"phi_mean{s}" for s in sfxs], what="rows")
 
     t = np.array([r["time_s"] for r in cov_rows])
-    cov = np.array([r["cov"] for r in cov_rows], float)
+    series = {"t": t, "profile": prof_rows,
+              "phases": [(sfx, label) for _, sfx, label in phases]}
     rows = []
-    row = series_row("phase_uniformity.csv", "Zonal CoV of Phase Fraction [-]",
-                     t, cov, t_start, "zonal")
-    if row:
-        rows.append(row)
-        log(f"  {row['variable']}: {row['mean']:.4g} \u00b1 {row['std']:.3g}")
-    return rows, {"t": t, "cov": cov, "profile": prof_rows}
+    for _, sfx, label in phases:
+        series[f"cov{sfx}"] = np.array([r[f"cov{sfx}"] for r in cov_rows], float)
+        var = f"Zonal CoV of Phase Fraction ({label}) [-]" if label \
+            else "Zonal CoV of Phase Fraction [-]"
+        row = series_row("phase_uniformity.csv", var, t, series[f"cov{sfx}"],
+                         t_start, "zonal")
+        if row:
+            rows.append(row)
+            log(f"  {row['variable']}: {row['mean']:.4g} \u00b1 {row['std']:.3g}")
+    return rows, series
 
 
 def resolution_check(files: list[Path], t_start: float, voxel_size: float,
@@ -880,7 +1061,7 @@ def resolution_check(files: list[Path], t_start: float, voxel_size: float,
     if ratio < 5:
         warn(f"Hinze maximum stable drop size is only {ratio:.3g} voxels (< 5): "
              "drop sizes are under-resolved, DSD/d32 results reflect the grid "
-             "scale; macro-dispersion metrics (F_disp, holdup) remain meaningful")
+             "scale; the specific interfacial area and holdup remain meaningful")
     common = {"file": fluid[0].name, "steady_method": "hinze",
               "steady_start_s": t_start, "end_time_s": row["end_time_s"],
               "n_samples": row["n_samples"], "std": "", "min": "", "max": ""}
@@ -1019,43 +1200,51 @@ def plot_dispersion(disp: dict, t_start: float, out_html: Path) -> None:
     d32 = []
     if "d32" in itf:
         d32.append(line(itf["t"], itf["d32"], "d32 (interface)"))
-    if "d32_m" in vof:
-        d32.append(line(vof["t"], vof["d32_m"], "d32 (VOF)"))
-        d32.append(line(vof["t"], vof["d32_excl_largest_m"], "d32 excl. largest (VOF)"))
+    phases = vof.get("phases", [])
+    for tag, label in phases:
+        d32.append(line(vof["t"], vof[f"d32_m_{tag}"], f"d32 ({label} drops)"))
     if d32:
         panels.append(("Sauter diameter d32(t)", d32, True, "m"))
-    if "F_disp" in vof:
-        panels.append(("Dispersed fraction F_disp(t)",
-                       [line(vof["t"], vof["F_disp"], "F_disp")], True, "-"))
+    if phases:
+        panels.append(("Dispersed fraction F_disp(t) = V_drops / V_fluid",
+                       [line(vof["t"], vof[f"F_disp_{tag}"], label)
+                        for tag, label in phases], True, "-"))
         panels.append(("Number of drops n_drops(t)",
-                       [line(vof["t"], vof["n_drops"], "n_drops")], True, "-"))
-    if "cov" in uni:
+                       [line(vof["t"], vof[f"n_drops_{tag}"], label)
+                        for tag, label in phases], True, "-"))
+    if np.isfinite(vof.get("coverage", [np.nan])).any():
+        panels.append(("Drop interface coverage A_drops/A_int (t)",
+                       [line(vof["t"], vof["coverage"], "coverage")], True, "-"))
+    if uni.get("phases"):
         panels.append(("Zonal CoV of phase fraction (t)",
-                       [line(uni["t"], uni["cov"], "CoV")], True, "-"))
+                       [line(uni["t"], uni[f"cov{sfx}"], f"CoV {label}".strip())
+                        for sfx, label in uni["phases"]], True, "-"))
 
-    dsd = [(d, v) for t, d, v, largest in vof.get("dsd", []) if t >= t_start and not largest]
+    dsd = [(d, label) for t, d, v, label in vof.get("dsd", []) if t >= t_start]
     if dsd:
-        d, v = np.array(dsd).T
+        d = np.array([x[0] for x in dsd])
         edges = np.histogram_bin_edges(d, bins=min(40, max(5, int(np.sqrt(d.size)))))
-        num, _ = np.histogram(d, edges)
-        vw, _ = np.histogram(d, edges, weights=v)
         centers, width = (edges[:-1] + edges[1:]) / 2, np.diff(edges)
-        panels.append(("Steady-state DSD (largest structure excluded)", [
-            go.Bar(x=centers, y=num / num.sum(), width=width, name="number-weighted",
-                   opacity=0.6),
-            go.Bar(x=centers, y=vw / vw.sum(), width=width, name="volume-weighted",
-                   opacity=0.6),
-        ], False, "fraction"))
+        bars = []
+        for _, label in phases:
+            num, _ = np.histogram([x[0] for x in dsd if x[1] == label], edges)
+            if num.sum():
+                bars.append(go.Bar(x=centers, y=num / num.sum(), width=width,
+                                   name=f"{label} drops", opacity=0.6))
+        panels.append(("Steady-state DSD (number-weighted, per fluid)", bars,
+                       False, "fraction"))
 
     if uni.get("profile"):
         prof = uni["profile"]
+        # with two fluids phi_2 = 1 - phi_1, so one heatmap suffices
+        sfx, label = uni["phases"][-1]
         times = sorted({r["time_s"] for r in prof})
         zs = np.unique(np.round([r["z_m"] for r in prof], 9))
         grid = np.full((zs.size, len(times)), np.nan)
         ti = {t: i for i, t in enumerate(times)}
         for r in prof:
-            grid[np.searchsorted(zs, round(r["z_m"], 9)), ti[r["time_s"]]] = r["phi_mean"]
-        panels.append(("Holdup profile \u03c6(z, t)", [
+            grid[np.searchsorted(zs, round(r["z_m"], 9)), ti[r["time_s"]]] = r[f"phi_mean{sfx}"]
+        panels.append((f"Holdup profile \u03c6(z, t) {label}".strip(), [
             go.Heatmap(x=times, y=zs, z=grid, colorscale="Viridis",
                        colorbar=dict(title="\u03c6", len=0.3, y=0.15),
                        hovertemplate="t=%{x:.4g} s<br>z=%{y:.4g} m<br>\u03c6=%{z:.4g}<extra></extra>")
@@ -1132,19 +1321,31 @@ def process_case(case: Path, stats_dir: Path, args,
     base = case if case.is_dir() else case.parent
     disp: dict = {}
     if args.dispersion:
+        voxel = args.voxel_size or input_voxel_size(base)
+        if voxel is None:
+            fail(f"{case}: --dispersion needs --voxel-size (no <dx> found in input.xml)")
+        if not args.voxel_size:
+            log(f"voxel size: {voxel:g} m (<dx> from input.xml)")
         rows_itf, disp["interface"] = interface_metrics(
             files, stats_dir, t_start, args.dispersed_fraction, args.liquid_volume)
         rows.extend(rows_itf)
-        vof_root = base
-        if args.vof_dir is not None:
-            vof_root = args.vof_dir if args.vof_dir.is_absolute() or not args.batch \
-                else base / args.vof_dir
-        rows_vof, disp["vof"] = vof_structures(vof_root, args.min_voxels, args.voxel_size,
-                                               t_start, out_dir=base)
-        rows.extend(rows_vof)
-        if args.voxel_size:
-            rows.extend(resolution_check(files, t_start, args.voxel_size, args.sigma,
-                                         args.rho_continuous, args.hinze_c))
+        fluids = fluid_volumes(files)
+        if len(fluids) != 2:
+            warn("--dispersion: Fluid.txt has no 'Fluid N (name) Volume' columns "
+                 "for two fluids (free-surface or single-fluid case); skipping "
+                 "drop statistics")
+        else:
+            vof_root = base
+            if args.vof_dir is not None:
+                vof_root = args.vof_dir if args.vof_dir.is_absolute() or not args.batch \
+                    else base / args.vof_dir
+            itf = disp["interface"]
+            a_int = (itf["t"], itf["area"]) if "area" in itf else None
+            rows_vof, disp["vof"] = vof_structures(vof_root, args.min_voxels, voxel,
+                                                   t_start, fluids, a_int, out_dir=base)
+            rows.extend(rows_vof)
+        rows.extend(resolution_check(files, t_start, voxel, args.sigma,
+                                     args.rho_continuous, args.hinze_c))
     if args.uniformity:
         rows_uni, disp["uniformity"] = phase_uniformity(
             base, args.zones_z, args.zones_r, t_start, args.vertical_axis,
@@ -1201,7 +1402,7 @@ def main(argv=None):
                          "velocity, vorticity, mixed time, shear, power "
                          "number, fluid volume, viscosity, density, rotation "
                          "speed, angular velocity, interfacial area, d32, "
-                         "dispersed fraction, n_drops, cov)")
+                         "dispersed fraction, n_drops, cov, coverage, hinze)")
     ap.add_argument("--plot", nargs="*", metavar="VAR", default=None,
                     help="write one interactive HTML of plots per stats file; "
                          "give variable names (fuzzy) to limit which are plotted, "
@@ -1216,9 +1417,11 @@ def main(argv=None):
         "--voxel-size 5e-4 --sigma 0.05 --rho-continuous 998 --plot")
     dg.add_argument("--dispersion", action="store_true",
                     help="interfacial-area metrics from the interface stats file, "
-                         "drop size distribution / dispersed fraction from the "
-                         "Volume VOF Surface .vtp output, and (with --voxel-size, "
-                         "--sigma, --rho-continuous) a Hinze resolution check")
+                         "per-fluid drop statistics (n_drops, d32, d32/dx, "
+                         "F_disp = V_drops/V_fluid) and interface coverage "
+                         "A_drops/A_int from the Volume VOF Surface .vtp output "
+                         "(Immiscible Two-Fluid only), and (with --sigma, "
+                         "--rho-continuous) a Hinze resolution check")
     dg.add_argument("--dispersed-fraction", type=float, default=None, metavar="PHI",
                     help="dispersed-phase volume fraction, for the area-based "
                          "d32 = 6*PHI/a")
@@ -1230,8 +1433,9 @@ def main(argv=None):
                          "files (default: the case directory; relative to each "
                          "case with --batch)")
     dg.add_argument("--voxel-size", type=float, default=None, metavar="M",
-                    help="lattice spacing [m] for the debris filter and the "
-                         "resolution check")
+                    help="lattice spacing [m] for the debris filter, d32/dx and "
+                         "the resolution check; required with --dispersion "
+                         "unless <dx> is found in the case's input.xml")
     dg.add_argument("--min-voxels", type=float, default=8,
                     help="VOF structures smaller than this many voxels are "
                          "dropped as numerical debris")

@@ -57,7 +57,8 @@ OPTIONS
                         mixed time, shear, power number, fluid volume,
                         viscosity, density, rotation speed, angular
                         velocity, interfacial area, d32, dispersed
-                        fraction, n_drops, cov; with the default list, LB
+                        fraction, n_drops, cov, coverage, hinze; with the
+                        default list, LB
                         variables and Min/Max variants are excluded so
                         only mean values are reported)
 
@@ -90,17 +91,31 @@ PHASE DISPERSION OPTIONS (Immiscible Two-Fluid)
                           a(t) = A_int/V_liq [1/m] and area-based Sauter
                           diameter d32(t) = 6*phi/a [m];
                         - from the Volume VOF Surface .vtp files (name
-                          containing "VOF", Slice outputs excluded): per
-                          frame drop count n_drops, d32 = 6*sum(V)/sum(A),
-                          d10, d43, largest drop diameter, d32 excluding
-                          the largest structure, and dispersed fraction
-                          F_disp = 1 - V_largest/V_total. Only closed
-                          structures are counted (open/clipped ones, e.g. a
-                          bulk layer touching the walls, are reported as
-                          n_open). Frame times come from the 'TIME' field
-                          data, else from the filename;
-                        - with --voxel-size, --sigma and --rho-continuous:
-                          the Hinze resolution check (see --hinze-c).
+                          containing "VOF" but not "structure", Slice
+                          outputs excluded), Immiscible Two-Fluid only
+                          (needs 'Fluid N (name) Volume' columns in
+                          Fluid.txt; skipped for free-surface cases):
+                          drops are closed structures of at least
+                          --min-voxels voxels. The bulk phases touch the
+                          walls/shaft/impeller, are open and are excluded
+                          (reported as n_open). Each drop is assigned to
+                          the fluid inside it, sampled from the Fluid 1
+                          volume fraction in the .vti volume output at the
+                          same time (else from the triangle orientation;
+                          M-Star orients the normals toward fluid 2). Per
+                          fluid: n_drops, d32 = 6*sum(V)/sum(A), d32/dx,
+                          d10, d43, largest drop diameter and
+                          F_disp = V_drops / V_fluid (fluid volume from
+                          Fluid.txt). Plus the interface coverage
+                          A_drops/A_int: the share of the interface-file
+                          area carried by closed drops, i.e. how much of
+                          the dispersion the drop statistics describe.
+                          Frame times come from the 'TIME' field data,
+                          else from the filename;
+                        - with --sigma and --rho-continuous: the Hinze
+                          resolution check (see --hinze-c).
+                        Needs the voxel size: --voxel-size, or <dx> from
+                        the case's input.xml.
 
     --dispersed-fraction PHI
                         Dispersed-phase volume fraction (0 < PHI < 1); the
@@ -115,7 +130,9 @@ PHASE DISPERSION OPTIONS (Immiscible Two-Fluid)
 
     --voxel-size M      Lattice spacing [m]. Structures smaller than
                         --min-voxels voxels are dropped as numerical debris;
-                        without it all structures are kept.
+                        also used for d32/dx and the resolution check.
+                        Required with --dispersion unless <dx> is found in
+                        input.xml.
 
     --min-voxels N      Debris threshold in voxels. (default: 8)
 
@@ -130,16 +147,21 @@ PHASE DISPERSION OPTIONS (Immiscible Two-Fluid)
                         steady mean energy dissipation rate [W/kg] from
                         Fluid.txt. d_max/voxel size is reported; below 5
                         a warning is issued that DSD/d32 reflect the grid
-                        scale (F_disp and holdup stay meaningful).
-                        (default: 0.725)
+                        scale (the specific interfacial area and holdup
+                        stay meaningful). (default: 0.725)
 
     --uniformity        Zonal CoV and vertical holdup profile of the phase
                         fraction from the 3D Volume .vti output (array name
                         containing "vof", "phase" or "fraction"; a "solid"
                         or "flag" array, if present, masks non-fluid
-                        voxels where nonzero). phi is averaged into
+                        voxels where nonzero, else voxels where the
+                        'Fluid N ... Volume Fraction' arrays sum to < 0.5
+                        are treated as solid; BoundaryConditions output
+                        is ignored). phi is averaged into
                         axial x radial zones before the volume-weighted
-                        CoV = std/mean is computed.
+                        CoV = std/mean is computed. With two 'Fluid N ...
+                        Volume Fraction' arrays (Immiscible Two-Fluid), the
+                        CoV and holdup profile are reported for each fluid.
 
     --zones-z N         Number of axial zones. (default: 10)
 
@@ -254,20 +276,25 @@ OUTPUT
                         cases in the batch.
 
     vof_structures.csv  (with --dispersion) Per VOF frame: region, open and
-                        debris counts, n_drops, d32, d10, d43, d_max,
-                        d32 excluding the largest structure, F_disp.
+                        debris counts, iso-surface / drop / interface-file
+                        areas, coverage, and per fluid (suffix _fluid1,
+                        _fluid2): n_drops, V_drops, F_disp, d32, d32/dx,
+                        d10, d43, d_max.
 
-    vof_dsd.csv         (with --dispersion) Per frame and kept structure:
-                        time, region id, equivalent diameter, volume, area.
+    vof_dsd.csv         (with --dispersion) Per frame and drop: time, fluid
+                        inside the drop, region id, equivalent diameter,
+                        volume, area.
 
     phase_uniformity.csv
-                        (with --uniformity) Per frame: zonal CoV and mean phi.
+                        (with --uniformity) Per frame: zonal CoV and mean phi
+                        (per fluid, suffix _fluid1/_fluid2, for two fluids).
 
     holdup_profile.csv  (with --uniformity) Per frame: phi averaged over
                         each horizontal voxel layer, phi(z).
 
     stats_plots/dispersion.html
                         (with --plot and --dispersion/--uniformity) a(t),
-                        d32(t) from both methods, F_disp(t), n_drops(t),
-                        CoV(t), steady-state DSD histogram (number and
-                        volume weighted) and phi(z, t) heatmap.
+                        d32(t) from the interface and per fluid, F_disp(t)
+                        and n_drops(t) per fluid, coverage(t), CoV(t),
+                        steady-state DSD histogram per fluid and phi(z, t)
+                        heatmap.
