@@ -84,10 +84,53 @@ def test_interface_metrics_liquid_volume_override_and_no_phi(stats_case, capsys)
     _, stats = stats_case
     files = mss.find_stats_files(stats)
     rows, series = mss.interface_metrics(files, stats, 1.0, phi=None, v_liq=2e-3)
-    assert [r["variable"] for r in rows] == ["Specific Interfacial Area [1/m]"]
+    assert rows[0]["variable"] == "Specific Interfacial Area [1/m]"
+    assert not any("d32" in r["variable"] for r in rows)
     assert rows[0]["mean"] == pytest.approx(1.5)
     assert "d32" not in series
     assert "--dispersed-fraction not given" in capsys.readouterr().err
+
+
+def test_dispersion_kinetics_exponential():
+    a0, a_ss, tau = 10.0, 100.0, 1.5
+    t = np.arange(0.0, 30.0, 0.05)
+    a = a_ss - (a_ss - a0) * np.exp(-t / tau)
+    k = mss.dispersion_kinetics(t, a, window=1.0, tol=0.005)
+    assert k["a0"] == pytest.approx(a0)
+    assert k["a_ss"] == pytest.approx(a_ss, rel=0.01)
+    assert k["E"] == pytest.approx(a_ss / a0, rel=0.01)
+    assert k["t90"] == pytest.approx(tau * np.log(10), rel=0.03)
+    assert k["t95"] == pytest.approx(-tau * np.log(0.05), rel=0.03)
+    assert k["tau"] == pytest.approx(tau, rel=0.05)
+    assert k["plateau_cov"] < 0.01
+    T = t[-1]
+    assert k["int_a"] == pytest.approx(a_ss * T - (a_ss - a0) * tau * (1 - np.exp(-T / tau)),
+                                       rel=1e-3)
+
+
+def test_dispersion_kinetics_no_plateau_warns(tmp_path, capsys):
+    stats = tmp_path / "Stats"
+    t = np.arange(0.0, 5.0, 0.05)
+    write_table(stats / "Interface.txt", ["Time [s]", "Area [m^2]"], [t, 1e-3 * (1 + t)])
+    rows, series = mss.interface_metrics(mss.find_stats_files(stats), stats, 0.0, None,
+                                         1e-3, vessel_diameter=0.1)
+    assert np.isnan(series["kinetics"]["t_ss_a"])
+    err = capsys.readouterr().err
+    assert "dispersion still developing" in err
+    assert "flat-interface estimate" in err  # a0 = 1 vs pi*0.01/4/1e-3 = 7.85 1/m
+
+
+def test_interface_area_column_selection(tmp_path, capsys):
+    stats = tmp_path / "Stats"
+    t = np.arange(0.0, 1.0, 0.1)
+    write_table(stats / "Interface.txt", ["Time [s]", "Wall Area [m^2]", "Area [m^2]"],
+                [t, np.ones_like(t), np.full_like(t, 2.0)])
+    files = mss.find_stats_files(stats)
+    rows, _ = mss.interface_metrics(files, stats, 0.0, None, 1.0)
+    assert rows[0]["mean"] == pytest.approx(1.0)
+    assert "several area columns" in capsys.readouterr().err
+    rows, _ = mss.interface_metrics(files, stats, 0.0, None, 1.0, area_column="wall")
+    assert rows[0]["mean"] == pytest.approx(1.0)
 
 
 def test_interface_metrics_missing_area_lists_headers(tmp_path, capsys):
@@ -107,6 +150,11 @@ def test_resolution_check(stats_case):
     d_h = 0.725 * (0.05 / 1000.0) ** 0.6 * 1.0 ** -0.4  # instantaneous eps = 1 W/kg
     assert r["Hinze Max Stable Drop Size [m]"]["mean"] == pytest.approx(d_h)
     assert r["Hinze Drop Size / Voxel Size [-]"]["mean"] == pytest.approx(d_h / 1e-4)
+
+    rows = mss.resolution_check(mss.find_stats_files(stats), 1.0, 1e-4, sigma=0.05,
+                                rho_c=1000.0, k_phi=3.0, eps_ratio=10.0, phi=0.5)
+    d_c = 0.725 * 2.5 * (0.05 / 1000.0) ** 0.6 * 10.0 ** -0.4
+    assert by_variable(rows)["Hinze Max Stable Drop Size [m]"]["mean"] == pytest.approx(d_c)
 
 
 # ---------------------------------------------------------------- (b) VOF structures
@@ -237,8 +285,11 @@ def test_vof_structures_metrics(vof_case):
 
 
 def test_vof_structures_min_voxel_filter(vof_case):
-    _, series = mss.vof_structures(vof_case, 0, VOXEL, 0.0, fluids())
+    _, series = mss.vof_structures(vof_case, 0, VOXEL, 0.0, fluids(), min_d_dx=0)
     assert series["n_drops_fluid1"][0] == len(RADII) + 2  # debris sphere kept
+    # default min_d_dx = 4 excludes the 2-voxel sphere
+    _, series = mss.vof_structures(vof_case, 0, VOXEL, 0.0, fluids())
+    assert series["n_drops_fluid1"][0] == len(RADII) + 1
     # threshold above the smallest real drop (r = 1 cm, ~4189 voxels) removes it too
     _, series = mss.vof_structures(vof_case, 5000, VOXEL, 0.0, fluids())
     assert series["n_drops_fluid1"][0] == len(RADII)
@@ -261,6 +312,30 @@ def test_vof_structures_phase_from_vti(tmp_path, capsys):
     assert series["n_drops_fluid1"][0] == 0 and series["n_drops_fluid2"][0] == 1
     err = capsys.readouterr().err
     assert "disagrees with triangle orientation for 1 of 1" in err
+
+
+def test_vof_structures_two_block_seam(tmp_path):
+    out = tmp_path / "case" / "Output"
+    sphere = pv.Sphere(radius=0.01, theta_resolution=40, phi_resolution=40)  # outward
+    halves = [sphere.clip("z", value=0.0).triangulate(),
+              sphere.clip("z", value=0.0, invert=False).triangulate()]
+    halves[1].points[:, :] += 1e-11  # seam vertices do not coincide exactly
+    for b, (half, z0) in enumerate(zip(halves, (-0.015, 0.0))):
+        d = out / "VolumeVOFSurface" / f"block{b}"
+        d.mkdir(parents=True)
+        pv.PolyData(half.points, half.faces).save(d / "VOFSurface.1.00000e+00.vtp")
+        img = pv.ImageData(dimensions=(31, 31, 16), spacing=(VOXEL,) * 3,
+                           origin=(-0.015, -0.015, z0))
+        r = np.linalg.norm(img.cell_centers().points, axis=1)
+        img.cell_data["Fluid 1 (Water) Volume Fraction (-)"] = (r > 0.01).astype(float)
+        img.cell_data["Fluid 2 (Oil) Volume Fraction (-)"] = (r <= 0.01).astype(float)
+        (out / "Volume" / f"block{b}").mkdir(parents=True)
+        img.save(out / "Volume" / f"block{b}" / "Volume.1.00000e+00.vti")
+
+    _, series = mss.vof_structures(tmp_path / "case", 8, VOXEL, 0.0, fluids())
+    assert series["n_open"][0] == 0
+    assert series["n_drops_fluid1"][0] == 0 and series["n_drops_fluid2"][0] == 1
+    assert series["d32_m_fluid2"][0] == pytest.approx(0.02, rel=0.01)
 
 
 def test_vof_structures_structure_id_array(tmp_path):
@@ -300,10 +375,11 @@ def test_phase_uniformity_vertical_gradient(tmp_path):
     # zone means are the bin centers (b + 0.5)/10, all bins equal volume
     centers = (np.arange(10) + 0.5) / 10
     expected_cov = centers.std() / centers.mean()
-    np.testing.assert_allclose(series["cov"], expected_cov, rtol=1e-6)
-    assert rows[0]["variable"] == "Zonal CoV of Phase Fraction [-]"
+    np.testing.assert_allclose(series["cov_10x3"], expected_cov, rtol=1e-6)
+    assert rows[0]["variable"] == "Zonal CoV of Phase Fraction (10x3) [-]"
     assert rows[0]["steady_method"] == "zonal"
     assert rows[0]["mean"] == pytest.approx(expected_cov, rel=1e-6)
+    assert not any("Segregation" in r["variable"] for r in rows)  # single array
 
     prof = [r for r in series["profile"] if r["time_s"] == 1.0]
     assert len(prof) == 40
@@ -335,12 +411,65 @@ def test_phase_uniformity_two_fluids_and_solid(tmp_path):
     rows, series = mss.phase_uniformity(case, 10, 3, t_start=0.0)
     centers = (np.arange(10) + 0.5) / 10
     r = by_variable(rows)
-    assert r["Zonal CoV of Phase Fraction (Fluid 1) [-]"]["mean"] == pytest.approx(
+    assert r["Zonal CoV of Phase Fraction (Fluid 1, 10x3) [-]"]["mean"] == pytest.approx(
         centers.std() / centers.mean(), rel=1e-6)
-    assert r["Zonal CoV of Phase Fraction (Fluid 2) [-]"]["mean"] == pytest.approx(
+    assert r["Zonal CoV of Phase Fraction (Fluid 2, 10x3) [-]"]["mean"] == pytest.approx(
         centers.std() / (1 - centers).mean(), rel=1e-6)
     prof = series["profile"][0]
     assert prof["phi_mean_fluid1"] + prof["phi_mean_fluid2"] == pytest.approx(1.0)
+
+
+def write_two_fluid_vti(path: Path, t: float, phi1: np.ndarray | None = None,
+                        func=None) -> None:
+    img = pv.ImageData(dimensions=(21, 41, 21), spacing=(0.01, 0.01, 0.01),
+                       origin=(-0.1, 0.0, -0.1))
+    cc = img.cell_centers().points
+    p1 = func(cc) if func else phi1
+    img.cell_data["Fluid 1 (Water) Volume Fraction (-)"] = p1
+    img.cell_data["Fluid 2 (Oil) Volume Fraction (-)"] = 1.0 - p1
+    img.field_data["TIME"] = np.array([t])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(path)
+
+
+@pytest.mark.parametrize("name, func, s_expected, continuous", [
+    ("stratified", lambda c: (c[:, 1] < 0.2).astype(float), 1.0, "both"),
+    ("uniform", lambda c: np.full(len(c), 0.5), 0.0, "none"),
+    # isolated 1-cell oil drops on a 4-cell lattice in water
+    ("drops", lambda c: 1.0 - ((np.rint((c[:, 0] + 0.1) / 0.01 - 0.5) % 4 == 0)
+                               & (np.rint(c[:, 1] / 0.01 - 0.5) % 4 == 0)
+                               & (np.rint((c[:, 2] + 0.1) / 0.01 - 0.5) % 4 == 0)),
+     None, "Fluid 1 (Water)"),
+])
+def test_segregation_index_and_continuity(tmp_path, name, func, s_expected, continuous):
+    case = tmp_path / name
+    for t in (1.0, 2.0, 3.0):
+        write_two_fluid_vti(case / "Output" / "Volume" / "block0" / f"Volume.{t:.5e}.vti",
+                            t, func=func)
+    rows, series = mss.phase_uniformity(case, 10, 3, t_start=0.0,
+                                        zone_scales=[(5, 2), (10, 3)])
+    r = by_variable(rows)
+    if s_expected is not None:
+        s = r["Segregation Index S (Fluid 1, 10x3) [-]"]["mean"]
+        assert s == pytest.approx(s_expected, abs=1e-9)
+    assert "Segregation Index S (Fluid 2, 5x2) [-]" in r
+    assert r["Continuous Phase"]["mean"].startswith(continuous)
+    with open(case / "phase_uniformity.csv") as fh:
+        cols = next(csv.reader(fh))
+    assert {"S_fluid1_5x2", "S_fluid2_10x3", "cov_fluid1_10x3"} <= set(cols)
+    assert (case / "phase_continuity.csv").exists()
+
+
+def test_homogeneity_time(tmp_path):
+    # stratified layer relaxes to uniform: phi1 = 0.5 + 0.5*sign(0.2 - y)*exp(-t)
+    case = tmp_path / "case"
+    for t in np.arange(0.0, 15.0, 0.5):
+        write_two_fluid_vti(
+            case / "Output" / "Volume" / "block0" / f"Volume.{t:.5e}.vti", t,
+            func=lambda c, t=t: 0.5 + 0.5 * np.sign(0.2 - c[:, 1]) * np.exp(-t))
+    rows, _ = mss.phase_uniformity(case, 10, 3, t_start=0.0, window=1.0, tol=0.02)
+    t_s = by_variable(rows)["Homogeneity Time t_S (Fluid 1, 10x3) [s]"]["mean"]
+    assert t_s == pytest.approx(-np.log(0.05), abs=0.5)  # S(t) = exp(-t)
 
 
 def test_phase_uniformity_missing_array(tmp_path, capsys):
@@ -360,21 +489,61 @@ def test_main_dispersion_end_to_end(stats_case, vof_case, tmp_path):
         dest = case / p.relative_to(vof_case)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(p.read_bytes())
-    write_vti(case / "Output" / "Volume" / "block0" / "Volume.1.00000e+00.vti", 1.0)
+    write_two_fluid_vti(case / "Output" / "Volume" / "block0" / "Volume.1.00000e+00.vti",
+                        1.0, func=lambda c: (c[:, 1] < 0.2).astype(float))
 
     mss.main([str(case), "--time", "0.5", "--dispersion", "--dispersed-fraction", "0.2",
               "--voxel-size", str(VOXEL), "--sigma", "0.05", "--rho-continuous", "1000",
-              "--uniformity", "--plot", "mean velocity"])
+              "--uniformity", "--disp-time", "0.5", "--zone-scales", "5x2", "10x3",
+              "--plot", "mean velocity"])
 
     with open(case / "stats_summary.csv") as fh:
-        methods = {r["steady_method"] for r in csv.DictReader(fh)}
-    assert {"interface", "vof", "zonal", "hinze"} <= methods
+        rows = list(csv.DictReader(fh))
+    methods = {r["steady_method"] for r in rows}
+    assert {"interface", "a(t) kinetics", "user"} <= methods
+    seg = [r for r in rows if r["variable"].startswith("Segregation Index")]
+    assert seg and all(r["steady_method"] == "user" and float(r["steady_start_s"]) == 0.5
+                       for r in seg)
     assert (case / "stats_plots" / "dispersion.html").exists()
     with open(case / "stats_summary_means.csv") as fh:
         cols = next(csv.reader(fh))
     for q in ("interfacial area", "d32", "dispersed fraction", "n_drops", "cov",
-              "coverage", "hinze drop size / voxel", "d32 / voxel size"):
+              "coverage", "hinze drop size / voxel", "d32 / voxel size",
+              "interface enhancement", "dispersion time t95",
+              "plateau cov", "time-integrated", "segregation index s (fluid 1, 5x2)",
+              "segregation index s (fluid 1, 10x3)", "continuous phase"):
         assert any(q in c.lower() for c in cols), q
+
+    # without --disp-time the VTK metrics start at the a(t) plateau (step at t = 1 s)
+    mss.main([str(case), "--time", "0.5", "--dispersion", "--voxel-size", str(VOXEL),
+              "--uniformity"])
+    with open(case / "stats_summary.csv") as fh:
+        rows = list(csv.DictReader(fh))
+    t_ss = float(next(r["mean"] for r in rows
+                      if r["variable"].startswith("Interfacial Area Plateau Start")))
+    vof = [r for r in rows if r["file"] == "vof_structures.csv"]
+    assert vof and all(r["steady_method"] == "a(t) plateau"
+                       and float(r["steady_start_s"]) == pytest.approx(t_ss) for r in vof)
+
+
+def test_batch_ignores_hidden_folders(stats_case, tmp_path):
+    case, stats = stats_case
+    (case / ".archive" / "Stats").mkdir(parents=True)
+    (case / ".archive" / "Stats" / "Fluid.txt").write_text((stats / "Fluid.txt").read_text())
+    hidden = tmp_path / ".old_case" / "Stats"
+    hidden.mkdir(parents=True)
+    (hidden / "Fluid.txt").write_text((stats / "Fluid.txt").read_text())
+    cases = mss.find_batch_cases(tmp_path)
+    assert [c.name for c, _ in cases] == ["case"]
+    assert cases[0][1] == stats
+    assert all(".archive" not in str(f) for f in mss.find_stats_files(case))
+
+
+def test_ref_case(tmp_path):
+    rows = [{"case": c, "file": "Fluid.txt", "variable": "Mean Velocity [m/s]",
+             "unit": "m/s", "mean": v} for c, v in (("a", 1.0), ("base", 2.0))]
+    mss.write_wide_csv(rows, tmp_path / "m.csv", ["velocity"], ref_case="bas")
+    assert "reference case: base" in (tmp_path / "m.html").read_text()
 
 
 def test_default_run_has_no_dispersion_outputs(stats_case):

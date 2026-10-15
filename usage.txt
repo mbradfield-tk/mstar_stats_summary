@@ -76,6 +76,10 @@ OPTIONS
                         (default: <case>/stats_plots; ignored with --batch,
                         where plots go to <case>/stats_plots in each case)
 
+    --ref-case CASE     Reference case (exact name or unique substring) for
+                        the % differences in the means bar plots.
+                        (default: the first case)
+
     -h, --help          Show help message and exit.
 
 PHASE DISPERSION OPTIONS (Immiscible Two-Fluid)
@@ -83,25 +87,43 @@ PHASE DISPERSION OPTIONS (Immiscible Two-Fluid)
     All opt-in. The VTK-based parts (VOF structures, uniformity) need
     pyvista (pip install pyvista); without it they are skipped with a
     warning. New summary rows are tagged in steady_method as interface,
-    vof, zonal or hinze.
+    a(t) kinetics, vof, zonal, S(t) kinetics or hinze. VTK-based rows
+    (VOF drops, uniformity, continuity, Hinze) are averaged from
+    t_disp = max(flow steady state, a(t) plateau start) and then tagged
+    "a(t) plateau" (or "user" with --disp-time) with t_disp in
+    steady_start_s. If a(t) never plateaus, t_disp is the flow steady
+    state.
 
     --dispersion        Enable dispersion metrics:
                         - from the interface stats file (name containing
                           "interface"): specific interfacial area
                           a(t) = A_int/V_liq [1/m] and area-based Sauter
-                          diameter d32(t) = 6*phi/a [m];
+                          diameter d32(t) = 6*phi/a [m] (dropped when closed
+                          drops carry < 50% of the interface);
+                        - dispersion kinetics of a(t): a0 (first sample,
+                          flat interface), plateau start t_ss_a, a_ss,
+                          interface enhancement E = a_ss/a0, t90/t95 (first
+                          time (a - a0)/(a_ss - a0) reaches 0.90/0.95),
+                          time constant tau (log-linear fit), plateau CoV
+                          = std(a)/a_ss and the time integral of a from
+                          t = 0 [s/m]. Warns if a(t) never plateaus
+                          (extend the run) or a(t) starts late;
                         - from the Volume VOF Surface .vtp files (name
                           containing "VOF" but not "structure", Slice
                           outputs excluded), Immiscible Two-Fluid only
                           (needs 'Fluid N (name) Volume' columns in
                           Fluid.txt; skipped for free-surface cases):
-                          drops are closed structures of at least
-                          --min-voxels voxels. The bulk phases touch the
+                          drops are closed structures with an equivalent
+                          diameter of at least the stricter of
+                          --min-voxels voxels and --min-d-dx voxel sizes
+                          (resolved vs excluded counts are logged). The
+                          bulk phases touch the
                           walls/shaft/impeller, are open and are excluded
                           (reported as n_open). Each drop is assigned to
                           the fluid inside it, sampled from the Fluid 1
                           volume fraction in the .vti volume output at the
-                          same time (else from the triangle orientation;
+                          same time (at the drop centroid for drops < 4
+                          voxels across; else from the triangle orientation;
                           M-Star orients the normals toward fluid 2). Per
                           fluid: n_drops, d32 = 6*sum(V)/sum(A), d32/dx,
                           d10, d43, largest drop diameter and
@@ -119,7 +141,20 @@ PHASE DISPERSION OPTIONS (Immiscible Two-Fluid)
 
     --dispersed-fraction PHI
                         Dispersed-phase volume fraction (0 < PHI < 1); the
-                        area-based d32 is skipped without it.
+                        area-based d32 is skipped without it. Also used
+                        for the Hinze holdup correction (default there:
+                        minority volume fraction from Fluid.txt).
+
+    --disp-time T       Start time [s] for the VTK-based dispersion and
+                        uniformity metrics, overriding t_disp.
+
+    --area-column NAME  Interfacial area column (fuzzy) in the interface
+                        stats file. (default: the first column containing
+                        "area"; a warning lists them if there are several)
+
+    --vessel-diameter D Vessel diameter [m]; a warning is issued if a0
+                        differs by > 25% from the flat-interface estimate
+                        pi*D^2/4/V_liq.
 
     --liquid-volume M3  Liquid volume [m^3] for a = A_int/V_liq.
                         (default: 'Fluid Volume' from Fluid.txt)
@@ -136,6 +171,10 @@ PHASE DISPERSION OPTIONS (Immiscible Two-Fluid)
 
     --min-voxels N      Debris threshold in voxels. (default: 8)
 
+    --min-d-dx N        Drops with equivalent diameter < N voxel sizes are
+                        excluded as unresolved; the stricter of this and
+                        --min-voxels applies. (default: 4)
+
     --sigma S           Interfacial tension [N/m] for the resolution check.
 
     --rho-continuous RHO
@@ -143,12 +182,23 @@ PHASE DISPERSION OPTIONS (Immiscible Two-Fluid)
                         resolution check.
 
     --hinze-c C         Constant in the Hinze maximum stable drop size
-                        d_max = C*(sigma/rho_c)^0.6*eps^-0.4, with eps the
+                        d_max = C*(1 + K_PHI*phi)*(sigma/rho_c)^0.6
+                        *(EPS_RATIO*eps)^-0.4, with eps the
                         steady mean energy dissipation rate [W/kg] from
-                        Fluid.txt. d_max/voxel size is reported; below 5
+                        Fluid.txt (or --eps-file). Resolved eps excludes
+                        subgrid dissipation, so d_max is an upper estimate.
+                        d_max/voxel size is reported; below 5
                         a warning is issued that DSD/d32 reflect the grid
                         scale (the specific interfacial area and holdup
                         stay meaningful). (default: 0.725)
+
+    --k-phi K           Holdup (coalescence) correction factor. (default: 0)
+
+    --eps-ratio R       Local/mean eps ratio, e.g. impeller region.
+                        (default: 1)
+
+    --eps-file FILE     Stats file (path or name fragment, e.g. an impeller
+                        ControlVolume) to take eps from. (default: Fluid.txt)
 
     --uniformity        Zonal CoV and vertical holdup profile of the phase
                         fraction from the 3D Volume .vti output (array name
@@ -161,7 +211,22 @@ PHASE DISPERSION OPTIONS (Immiscible Two-Fluid)
                         axial x radial zones before the volume-weighted
                         CoV = std/mean is computed. With two 'Fluid N ...
                         Volume Fraction' arrays (Immiscible Two-Fluid), the
-                        CoV and holdup profile are reported for each fluid.
+                        CoV and holdup profile are reported for each fluid,
+                        plus the segregation index S = std/sqrt(mean*(1 -
+                        mean)) (0 homogeneous, 1 fully segregated), the
+                        homogeneity time t_S (S within 5% of its plateau)
+                        and, with scipy, the largest connected region share
+                        of phi_k > 0.5 per fluid and the continuous phase
+                        (share > --continuous-threshold; a warning flags a
+                        change after t_disp, i.e. phase inversion).
+
+    --zone-scales NZxNR [NZxNR ...]
+                        Zone scales for CoV and S, e.g. 5x2 10x3 20x5.
+                        (default: ZONES_Z x ZONES_R, i.e. 10x3)
+
+    --continuous-threshold F
+                        Largest-region share above which a fluid is
+                        continuous. (default: 0.9)
 
     --zones-z N         Number of axial zones. (default: 10)
 
@@ -286,15 +351,22 @@ OUTPUT
                         volume, area.
 
     phase_uniformity.csv
-                        (with --uniformity) Per frame: zonal CoV and mean phi
-                        (per fluid, suffix _fluid1/_fluid2, for two fluids).
+                        (with --uniformity) Per frame: mean phi and, per
+                        zone scale (suffix _NZxNR), zonal CoV and S (per
+                        fluid, suffix _fluid1/_fluid2, for two fluids).
+
+    phase_continuity.csv
+                        (with --uniformity, two fluids, scipy) Per frame:
+                        largest connected region share per fluid and the
+                        continuous phase.
 
     holdup_profile.csv  (with --uniformity) Per frame: phi averaged over
                         each horizontal voxel layer, phi(z).
 
     stats_plots/dispersion.html
                         (with --plot and --dispersion/--uniformity) a(t),
-                        d32(t) from the interface and per fluid, F_disp(t)
-                        and n_drops(t) per fluid, coverage(t), CoV(t),
+                        normalized a(t) with t95, d32(t) from the interface
+                        and per fluid, F_disp(t) and n_drops(t) per fluid,
+                        coverage(t), CoV(t), S(t), largest region share(t),
                         steady-state DSD histogram per fluid and phi(z, t)
                         heatmap.
