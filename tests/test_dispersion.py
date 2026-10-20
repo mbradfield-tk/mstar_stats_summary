@@ -539,6 +539,55 @@ def test_batch_ignores_hidden_folders(stats_case, tmp_path):
     assert all(".archive" not in str(f) for f in mss.find_stats_files(case))
 
 
+def test_batch_discovers_cases_nested_under_reactors(stats_case, tmp_path):
+    _, stats = stats_case
+    root = tmp_path / "step8"
+    expected = []
+    for reactor, subcases in (("10L", ("run-a", "run-b")),
+                              ("R101", ("run-c",)),
+                              ("R901", ("run-d", "run-e"))):
+        for subcase in subcases:
+            case = root / reactor / subcase
+            case_stats = case / "Stats"
+            case_stats.mkdir(parents=True)
+            (case_stats / "Fluid.txt").write_text((stats / "Fluid.txt").read_text())
+            expected.append((case, case_stats))
+
+    cases = mss.find_batch_cases(root)
+    assert cases == sorted(expected)
+
+
+def test_batch_mstar_out_layout(stats_case, tmp_path):
+    _, stats = stats_case
+    root = tmp_path / "step8"
+    for rel in ("CHP_10L/case-a", "CHP_10L/case-b", "CHP_R101/case-c"):
+        (root / rel / "out" / "Stats").mkdir(parents=True)
+        (root / rel / "input.xml").write_text("<input/>")
+    (root / "loose" / "out" / "Stats").mkdir(parents=True)  # no input.xml
+    ids = [c.relative_to(root).as_posix() for c, _ in mss.find_batch_cases(root)]
+    assert ids == ["CHP_10L/case-a", "CHP_10L/case-b", "CHP_R101/case-c", "loose"]
+
+
+def test_batch_output_root_and_case_filter(stats_case, tmp_path):
+    _, stats = stats_case
+    root = tmp_path / "step8"
+    for rel in ("10L/run-a", "10L/run-b", "R101/run-a"):
+        (root / rel / "Stats").mkdir(parents=True)
+        (root / rel / "Stats" / "Fluid.txt").write_text((stats / "Fluid.txt").read_text())
+    before = sorted(p for p in root.rglob("*"))
+    proj = tmp_path / "proj"
+    mss.main([str(root), "--batch", "--time", "0.5", "--plot", "velocity",
+              "--output-root", str(proj), "--cases", "10L/run-a", "R101/run-a"])
+    assert sorted(p for p in root.rglob("*")) == before
+    assert (proj / "10L" / "run-a" / "stats_summary.csv").is_file()
+    assert (proj / "R101" / "run-a" / "stats_plots").is_dir()
+    assert not (proj / "10L" / "run-b").exists()
+    with open(proj / "batch_summary_means.csv") as fh:
+        assert [r["case"] for r in csv.DictReader(fh)] == ["10L/run-a", "R101/run-a"]
+    with open(proj / "batch_summary_settings.csv") as fh:
+        assert [r["case"] for r in csv.DictReader(fh)] == ["10L/run-a", "R101/run-a"]
+
+
 def test_ref_case(tmp_path):
     rows = [{"case": c, "file": "Fluid.txt", "variable": "Mean Velocity [m/s]",
              "unit": "m/s", "mean": v} for c, v in (("a", 1.0), ("base", 2.0))]

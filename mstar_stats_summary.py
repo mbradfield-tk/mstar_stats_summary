@@ -749,7 +749,7 @@ def input_voxel_size(base: Path) -> float | None:
     return None
 
 
-def case_settings(case: Path, stats_dir: Path) -> dict:
+def case_settings(case: Path, stats_dir: Path, case_id: str | None = None) -> dict:
     """Simulation settings of one case from input.xml (dx, LX/LY/LZ, dt, Courant
     number, impeller speeds, per-fluid density/viscosity, surface tension) and
     Fluid.txt (initial fluid volume, max simulated Courant number)."""
@@ -765,7 +765,7 @@ def case_settings(case: Path, stats_dir: Path) -> dict:
             return txt.strip()
 
     base = case if case.is_dir() else case.parent
-    s: dict = {"case": case.name}
+    s: dict = {"case": case_id or case.name}
     dx = dt = None
     p = find_input_xml(base)
     root = None
@@ -1739,9 +1739,11 @@ def plot_dispersion(disp: dict, t_start: float, out_html: Path) -> None:
 # ---------------------------------------------------------------- main
 
 def process_case(case: Path, stats_dir: Path, args, output: Path | None = None,
-                 plot_dir: Path | None = None) -> tuple[list[dict], dict[str, list[dict]]]:
-    """Summarize one case; write its CSVs (and plots). Returns (all rows,
-    {"dispersion": rows, "uniformity": rows}); ([], {}) on failure."""
+                 plot_dir: Path | None = None, out_base: Path | None = None
+                 ) -> tuple[list[dict], dict[str, list[dict]]]:
+    """Summarize one case; write its CSVs (and plots) to out_base (default: the
+    case dir). Returns (all rows, {"dispersion": rows, "uniformity": rows});
+    ([], {}) on failure."""
     files = find_stats_files(stats_dir)
     if not files:
         warn(f"no .txt stats files found in {stats_dir}")
@@ -1778,6 +1780,8 @@ def process_case(case: Path, stats_dir: Path, args, output: Path | None = None,
     rows.extend(rows_mix)
 
     base = case if case.is_dir() else case.parent
+    out_base = out_base or base
+    out_base.mkdir(parents=True, exist_ok=True)
     disp: dict = {}
     disp_rows: list[dict] = []  # evaluated from t_disp
     groups: dict[str, list[dict]] = {"dispersion": [], "uniformity": []}
@@ -1818,7 +1822,7 @@ def process_case(case: Path, stats_dir: Path, args, output: Path | None = None,
             itf = disp["interface"]
             a_int = (itf["t"], itf["area"]) if "area" in itf else None
             rows_vof, disp["vof"] = vof_structures(vof_root, args.min_voxels, voxel,
-                                                   t_disp, fluids, a_int, out_dir=base,
+                                                   t_disp, fluids, a_int, out_dir=out_base,
                                                    min_d_dx=args.min_d_dx)
             disp_rows.extend(rows_vof)
             groups["dispersion"].extend(rows_vof)
@@ -1850,7 +1854,7 @@ def process_case(case: Path, stats_dir: Path, args, output: Path | None = None,
         scales = args.zone_scales or [(args.zones_z, args.zones_r)]
         rows_uni, disp["uniformity"] = phase_uniformity(
             base, args.zones_z, args.zones_r, t_disp, args.vertical_axis,
-            args.axis_center, out_dir=base, zone_scales=scales, window=args.window,
+            args.axis_center, out_dir=out_base, zone_scales=scales, window=args.window,
             tol=args.tol, continuity_threshold=args.continuous_threshold)
         disp_rows.extend(rows_uni)
         groups["uniformity"].extend(rows_uni)
@@ -1859,7 +1863,7 @@ def process_case(case: Path, stats_dir: Path, args, output: Path | None = None,
             r["steady_method"], r["steady_start_s"] = disp_method, t_disp
     rows.extend(disp_rows)
 
-    out = output or base / "stats_summary.csv"
+    out = output or out_base / "stats_summary.csv"
     write_csv(rows, out)
     kept = {id(r) for r in rows}  # the area-based d32 may have been dropped
     groups = {k: [r for r in g if id(r) in kept] for k, g in groups.items()}
@@ -1872,23 +1876,40 @@ def process_case(case: Path, stats_dir: Path, args, output: Path | None = None,
             warn(f"--{name}: no metrics computed; no {name} summary written")
 
     if args.plot is not None:
-        make_plots(files, stats_dir, args.plot, t_start,
-                   plot_dir or base / "stats_plots", mix_vlines=mix_vlines)
+        plot_dir = plot_dir or out_base / "stats_plots"
+        make_plots(files, stats_dir, args.plot, t_start, plot_dir, mix_vlines=mix_vlines)
         if disp:
-            plot_dispersion(disp, t_disp, (plot_dir or base / "stats_plots") / "dispersion.html")
+            plot_dispersion(disp, t_disp, plot_dir / "dispersion.html")
     return rows, groups
 
 
+def case_dir_of(stats_dir: Path, top: Path) -> Path:
+    """Case folder of a Stats dir: the nearest ancestor (up to top) holding
+    input.xml or a .msb file, else the Stats parent (its parent for M-Star's out/)."""
+    for d in [stats_dir.parent, *stats_dir.parent.parents]:
+        if (d / "input.xml").is_file() or any(d.glob("*.msb")):
+            return d
+        if d == top:
+            break
+    p = stats_dir.parent
+    return p.parent if p.name.lower() == "out" and p != top else p
+
+
 def find_batch_cases(parent: Path) -> list[tuple[Path, Path]]:
-    """Return (case dir, stats dir) for each immediate, non-hidden subfolder
-    with stats files."""
-    cases = []
+    """Return (case dir, stats dir) for cases under parent, at any depth."""
+    cases_by_dir: dict[Path, Path] = {}
     for sub in sorted(p for p in parent.iterdir()
                       if p.is_dir() and not p.name.startswith(".")):
-        stats_dir = locate_stats_dir(sub)
-        if stats_dir is not None:
-            cases.append((sub, stats_dir))
-    return cases
+        hits = sorted(p for p in sub.rglob("Stats")
+                      if p.is_dir() and not is_hidden(p, sub))
+        if hits:
+            for stats_dir in hits:
+                cases_by_dir.setdefault(case_dir_of(stats_dir, sub), stats_dir)
+        else:
+            stats_dir = locate_stats_dir(sub)
+            if stats_dir is not None:
+                cases_by_dir[sub] = stats_dir
+    return sorted(cases_by_dir.items())
 
 
 def main(argv=None):
@@ -1898,9 +1919,9 @@ def main(argv=None):
                     help="M-Star case directory, or the Stats directory itself; "
                          "with --batch, a parent directory of case subfolders")
     ap.add_argument("--batch", action="store_true",
-                    help="treat CASE as a parent directory and process every "
-                         "subfolder containing stats; writes one CSV per case "
-                         "plus a combined batch CSV")
+                    help="treat CASE as a parent directory and recursively "
+                        "process case subfolders containing stats; writes one "
+                        "CSV per case plus a combined batch CSV")
     ap.add_argument("--time", type=float, default=None,
                     help="user-defined steady-state start time [s]; "
                          "overrides automatic detection")
@@ -1935,6 +1956,14 @@ def main(argv=None):
     ap.add_argument("--plot-dir", type=Path, default=None,
                     help="plot output directory (default: <case>/stats_plots; "
                          "ignored with --batch)")
+    ap.add_argument("--output-root", type=Path, default=None, metavar="DIR",
+                    help="write all outputs under DIR instead of the case "
+                         "folders (with --batch, per-case outputs go to "
+                         "DIR/<case path relative to CASE>/), leaving the "
+                         "case folders untouched")
+    ap.add_argument("--cases", nargs="+", default=None, metavar="REL",
+                    help="with --batch, only process these cases (paths "
+                         "relative to CASE, as listed in the batch CSVs)")
 
     dg = ap.add_argument_group(
         "phase dispersion (Immiscible Two-Fluid; VTK parts need pyvista)",
@@ -2043,20 +2072,33 @@ def main(argv=None):
         cases = find_batch_cases(args.case)
         if not cases:
             fail(f"no case subfolders with stats found under {args.case}")
+        ids = {c: c.relative_to(args.case).as_posix() for c, _ in cases}
+        if args.cases:
+            wanted = {Path(c).as_posix().strip("/") for c in args.cases}
+            for c in sorted(wanted - set(ids.values())):
+                warn(f"--cases: '{c}' is not a case under {args.case}")
+            cases = [(c, sd) for c, sd in cases if ids[c] in wanted]
+            if not cases:
+                fail("--cases matched no cases")
         log(f"batch mode: {len(cases)} case(s) under {args.case}")
+        if args.output_root:
+            args.output_root.mkdir(parents=True, exist_ok=True)
 
         batch_rows = []
         batch_groups: dict[str, list[dict]] = {}
         for case, stats_dir in cases:
-            log(f"=== case: {case.name} ===")
-            rows, groups = process_case(case, stats_dir, args)
+            cid = ids[case]
+            log(f"=== case: {cid} ===")
+            rows, groups = process_case(
+                case, stats_dir, args,
+                out_base=args.output_root / cid if args.output_root else None)
             for r in rows:
-                batch_rows.append({"case": case.name, **r})
+                batch_rows.append({"case": cid, **r})
             for name, g in groups.items():
-                batch_groups.setdefault(name, []).extend({"case": case.name, **r} for r in g)
+                batch_groups.setdefault(name, []).extend({"case": cid, **r} for r in g)
         if not batch_rows:
             fail("no variables summarized in any case")
-        out = args.output or args.case / "batch_summary.csv"
+        out = args.output or (args.output_root or args.case) / "batch_summary.csv"
         write_csv(batch_rows, out, columns=["case"] + COLUMNS)
         write_wide_csv(batch_rows, out.with_name(f"{out.stem}_means{out.suffix}"),
                        args.means_vars or DEFAULT_MEANS_VARS,
@@ -2069,14 +2111,14 @@ def main(argv=None):
                           columns=["case"] + COLUMNS)
                 write_wide_csv(g, out.with_name(f"{out.stem}_{name}_means{out.suffix}"),
                                [""], warn_unmatched=False, ref_case=args.ref_case)
-        write_settings_csv([case_settings(c, sd) for c, sd in cases],
+        write_settings_csv([case_settings(c, sd, ids[c]) for c, sd in cases],
                            out.with_name(f"{out.stem}_settings{out.suffix}"))
     else:
         stats_dir = find_stats_dir(args.case)
         base = args.case if args.case.is_dir() else args.case.parent
-        out = args.output or base / "stats_summary.csv"
-        rows, groups = process_case(args.case, stats_dir, args,
-                                    output=out, plot_dir=args.plot_dir)
+        out = args.output or (args.output_root or base) / "stats_summary.csv"
+        rows, groups = process_case(args.case, stats_dir, args, output=out,
+                                    plot_dir=args.plot_dir, out_base=args.output_root)
         if not rows:
             fail("no variables summarized")
         write_wide_csv([{"case": args.case.name, **r} for r in rows],

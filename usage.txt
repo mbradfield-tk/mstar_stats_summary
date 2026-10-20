@@ -22,10 +22,22 @@ ARGUMENTS
 OPTIONS
 -------
     --batch             Treat CASE as a parent directory and process every
-                        subfolder containing stats. Writes one
-                        stats_summary.csv per case plus a combined
-                        batch_summary.csv (with a leading "case" column)
-                        in the parent directory.
+                        case found below it, at any depth (e.g. reactor
+                        folders each holding sub-cases). A case is the
+                        folder holding input.xml/.msb above a Stats folder.
+                        Writes one stats_summary.csv per case plus a
+                        combined batch_summary.csv (with a leading "case"
+                        column = case path relative to CASE) in the parent
+                        directory.
+
+    --cases REL [REL ...]
+                        With --batch, only process these cases (paths
+                        relative to CASE, as in the batch CSV "case" column).
+
+    --output-root DIR   Write all outputs under DIR instead of the case
+                        folders, which are then left untouched. With
+                        --batch, per-case outputs go to DIR/<case>/ and the
+                        batch CSVs to DIR/.
 
     --time T            User-defined steady-state start time in seconds.
                         Overrides automatic detection.
