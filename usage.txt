@@ -49,6 +49,38 @@ OPTIONS
 
     --tol TOL           Steady-state tolerance on windowed-mean drift.
                         (default: 0.02)
+                        The plateau starts where the mean of each window
+                        stops changing by more than TOL against the window
+                        before it. In a plateau of at least 10 windows,
+                        excursions shorter than one window are tolerated
+                        while they make up at most 10% of its samples, so
+                        one late fluctuation does not move the start to the
+                        end of the run.
+
+    Notes on the Stats files: M-Star's restart snapshots (Stats/run1,
+    run2, ...) are ignored, the top-level files hold the full history.
+    Rows whose column count differs from the header (a garbled line, the
+    half-written last line of a running solve) are skipped with a warning.
+    A negative impeller <freq> is a sense of rotation: speed-based results
+    (tip speed, Re, Fr, We, Po, blend time) use its magnitude.
+    VTK frames of a running solve's current output step (a .vtp/.vti file
+    without its closing tag, or a time step not every block has written yet)
+    are skipped with a warning. In --batch mode a case that fails (e.g.
+    --dispersion without <dx>) is reported and left out; the tables of the
+    other cases are still written.
+    Of several Stats folders below a case, <case>/out/Stats is used, else
+    <case>/Stats, else the shallowest one (never a copy such as
+    backup/out/Stats ahead of the case's own).
+    Wall time (cumulative) [h] and Iterations [count] are the last row of
+    Timing.txt: M-Star's counters run on over restarts. Where the wall time
+    counter starts again (drops to less than half) the runs are added; other
+    backward steps are ignored with a warning. If the time column goes
+    backwards (rows of several solver runs in one file) the largest counter
+    values are reported, with a warning.
+
+    Threads: OMP_NUM_THREADS, OPENBLAS_NUM_THREADS and MKL_NUM_THREADS are
+    set to 4 when the script starts, unless they are already set in the
+    environment (numpy otherwise starts one thread per core).
 
     --mix-rsd PCT       RSD threshold in % for the mixed-time of scalar
                         tracers; 5% RSD = 95% mixed. Applied to any RSD
@@ -103,8 +135,48 @@ PHASE DISPERSION OPTIONS (Immiscible Two-Fluid)
     (VOF drops, uniformity, continuity, Hinze) are averaged from
     t_disp = max(flow steady state, a(t) plateau start) and then tagged
     "a(t) plateau" (or "user" with --disp-time) with t_disp in
-    steady_start_s. If a(t) never plateaus, t_disp is the flow steady
-    state.
+    steady_start_s. If a(t) never plateaus, t_disp is the start of the
+    window the a(t) kinetics fall back to (the last max(--window, 25%) of
+    the a(t) trace, never before the flow steady state) and the rows are
+    tagged "a(t) (no plateau, last window)"; mass-transfer and assessment
+    rows then end in "(a(t), no plateau, last window)".
+
+    --workers N         Processes that analyse the VTK frames side by side
+                        (.vtp drop statistics and .vti uniformity); the
+                        results are identical to --workers 1. Each worker
+                        holds one frame in memory. A frame that fails in a
+                        worker, or a worker that dies, ends the case with
+                        an error naming the frame. (default: 1)
+
+    --reuse-results RUN_DIR [RUN_DIR ...]
+                        Earlier output roots, newest first. VOF-drop and
+                        uniformity metrics whose .vtp/.vti files are gone
+                        are taken from the first one holding them: the rows
+                        (tagged "(reused: <run>)" with the run that computed
+                        them) and the per-case CSVs. With --batch the rows
+                        of the case in <run>/batch_summary*.csv (else
+                        <run>/<case>/stats_summary*.csv), without --batch
+                        <run>/stats_summary*.csv. Everything else is
+                        recomputed. With --gas-liquid the same holds for
+                        the local estimate (gas_liquid_surface.csv).
+                        (default with --output-root <...>_dispersion or
+                        <...>_gas_liquid, with or without --batch: the
+                        earlier sibling folders of the same kind)
+
+    --no-reuse          Never reuse earlier results.
+
+    --addons-only       With --dispersion/--uniformity/--gas-liquid: write
+                        only their outputs, not the base summary, means and
+                        settings.
+
+    Multi-GPU output (block0, block1, ...): every block writes the VOF
+    surface of its own cells up to the centre plane of the neighbour's
+    first cell layer. The two cut rims lie on the same grid edges but not
+    at the same places (one block interpolates halo values; measured:
+    median 0.07, 99% below 0.34 voxels apart), so rim vertices of different
+    blocks within 0.5 voxels are welded and a drop crossing a block seam is
+    one closed structure. Only rim vertices on a seam move. Needs scipy;
+    without it such drops stay open and are excluded (warning).
 
     --dispersion        Enable dispersion metrics:
                         - from the interface stats file (name containing
@@ -252,8 +324,85 @@ PHASE DISPERSION OPTIONS (Immiscible Two-Fluid)
                         coordinates (x z for a y axis).
                         (default: domain center)
 
+GAS-LIQUID MASS TRANSFER OPTIONS (Free Surface)
+-----------------------------------------------
+    Liquid-side mass transfer through the free surface: the specific
+    free-surface area a = A/V_liq and estimates of kL and kLa. The case
+    must be run with M-Star's free-surface model (<fluidModelType> 2 in
+    input.xml); any other case fails with a message (with --batch the
+    other cases are still processed). Sparged or entrained gas below the
+    grid is not part of the estimate.
+
+    --gas-liquid [free-surface]
+                        Switch the estimate on. free-surface is the only
+                        route: transfer through the free surface alone.
+
+    --gas-diffusivity M2S
+                        Diffusivity D of the dissolved gas in the liquid
+                        [m^2/s]. Required.
+
+    --gas-nu M2S        Kinematic viscosity of the liquid [m^2/s].
+                        (default: input.xml)
+
+    --renewal-length M  Length L a liquid element travels along the surface
+                        before it is replaced: Higbie contact time
+                        t_c = L / u_s. (default: half the tank diameter)
+
+    --gas-no-local      Skip the local estimate from the VTK output.
+
+    Also used: --liquid-volume, --area-column, --vof-dir, --voxel-size,
+    --workers, --reuse-results / --no-reuse, --addons-only.
+
+    kL models (Sc = nu / D):
+        Lamont-Scott        0.4   (eps nu)^(1/4) Sc^(-1/2)
+        Kawase-Moo-Young    0.301 (eps nu)^(1/4) Sc^(-1/2)
+        Kastanek            1.13  (eps nu)^(1/4) Sc^(-1/2)   (Higbie with the
+                            Kolmogorov time (nu/eps)^(1/2) as contact time)
+        Calderbank-Moo-Young rigid surface
+                            0.13  (eps nu)^(1/4) Sc^(-2/3)   (surface held
+                            immobile by surfactants: lower bound)
+        Higbie              2 (D / (pi t_c))^(1/2), t_c = L / u_s
+        Thomas              Sh = kL D_imp / D = 0.19 Re^0.8 Sc^(1/3),
+                            Re = u_s D_imp / nu
+        Surface divergence  0.5 (D beta_rms)^(1/2), beta = divergence of the
+                            velocity in the plane of the surface (VTK only)
+
+    Each model is evaluated on up to three bases, named in the variable:
+      "bulk dissipation"      eps = impeller power / liquid mass, P/(rho
+                              V_liq), at every Stats sample (without a torque
+                              record: the resolved mean of Fluid.txt)
+      "surface mean (Stats)"  the surface means M-Star writes to
+                              Interface.txt for the fields of the VOF surface
+                              output: 'EDR Mean' (dissipation models) and
+                              'Velocity Mean' (Higbie, Thomas)
+      "local (VTK)"           the fields of the Volume .vti 1.5 voxels below
+                              each triangle of the VOF surface, integrated
+                              over it: kLa = (1/V_liq) sum kL_i dA_i. When the
+                              Volume output is written less often than the VOF
+                              surface (fewer than half of its frames), the
+                              point data on the surface is used instead.
+    kLa = kL a with a = A/V_liq (A from Interface.txt, or the area of the
+    VOF surface for the local estimate).
+
+    Grid assessment (gas_liquid_assessment.csv, rows "gas-liquid
+    assessment"), with eps_s = dissipation at the surface (local value,
+    else the Interface.txt mean, else the bulk value):
+      Kolmogorov scale eta_s = (nu^3/eps_s)^(1/4); a DNS of the surface
+      turbulence needs dx <= 2.1 eta_s
+      Batchelor scale eta_B = eta_s Sc^(-1/2)
+      concentration film delta_c = D/kL (Lamont-Scott at eps_s = 2.5 eta_B);
+      resolved with 10 voxels across, so dx <= delta_c / 10
+    each with the refinement dx / dx_required, the lattice cost factor
+    refinement^4 and the number of cells; plus capillary length / dx,
+    Hinze bubble size at eps_max / dx, the closed structures of the VOF
+    surface, and the blend-time correlation against t90 = ln 10 / kLa.
+
 EXAMPLES
 --------
+    # Free-surface kLa of a hydrogenation (H2 in the solvent), add-on only
+    python mstar_stats_summary.py case --gas-liquid free-surface \
+        --gas-diffusivity 1.5e-8 --addons-only --output-root results
+
     # Auto-detect steady state and write <case>/stats_summary.csv
     python mstar_stats_summary.py test
 
@@ -351,6 +500,31 @@ OUTPUT
     batch_summary_means.csv
                         (with --batch) Same wide means table across all
                         cases in the batch.
+
+    stats_summary_gas_liquid.csv, stats_summary_gas_liquid_means.csv
+                        (with --gas-liquid; batch: batch_summary_gas_liquid*)
+                        The free-surface area, kL and kLa of every model and
+                        basis, and the grid assessment.
+
+    gas_liquid_timeseries.csv
+                        (with --gas-liquid) Per Stats sample: free-surface
+                        area, liquid volume, a, A/A0, bulk dissipation, the
+                        surface means of Interface.txt, kL and kLa of the
+                        Stats-based models.
+
+    gas_liquid_surface.csv
+                        (with --gas-liquid) Per VOF surface frame: triangles,
+                        surface area, closed structures (bubbles, droplets),
+                        sampled area share, surface dissipation (area mean
+                        and the mean effective for kL, <eps^(1/4)>^4),
+                        surface speed, rms surface divergence, kL and kLa
+                        of the local models.
+
+    gas_liquid_assessment.csv
+                        (with --gas-liquid) check, value, unit, assessment,
+                        basis: the grid a calculation without a kL model
+                        would need, surface and bubble resolution, mixing
+                        against transfer.
 
     vof_structures.csv  (with --dispersion) Per VOF frame: region, open and
                         debris counts, iso-surface / drop / interface-file
